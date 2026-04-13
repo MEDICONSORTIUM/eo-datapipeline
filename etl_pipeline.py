@@ -34,8 +34,6 @@ storage_client = storage.Client(credentials=credentials)
 
 BUCKET_NAME = os.environ['BUCKET_NAME']
 
-BUCKET_NAME = os.environ['BUCKET_NAME']
-
 # ---------------------------------------
 # 2. DYNAMIC DATE LOGIC
 # ---------------------------------------
