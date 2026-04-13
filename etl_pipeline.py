@@ -2,124 +2,96 @@ import ee as status
 import os
 import json
 import time
-import io  # <-- Fix for pd.compat.StringIO
+import logging
 import pandas as pd
 import psycopg2
+from io import StringIO
 from google.oauth2 import service_account
 from google.cloud import storage
 
 # ---------------------------------------
-# 1. AUTHENTICATION & INITIALIZATION
+# 0. LOGGING SETUP
 # ---------------------------------------
-service_account_info = json.loads(os.environ['GCP_SA_JSON'])
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
 # ---------------------------------------
 # 1. AUTHENTICATION & INITIALIZATION
 # ---------------------------------------
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
 
-# One set of credentials with both required scopes
-combined_scopes = [
+# Define BOTH scopes in one list to avoid the 'invalid_scope' error
+scopes = [
     'https://www.googleapis.com/auth/earthengine',
     'https://www.googleapis.com/auth/cloud-platform'
 ]
 
+# Create ONE credentials object for both EE and GCS
 credentials = service_account.Credentials.from_service_account_info(
-    service_account_info,
-    scopes=combined_scopes
+    service_account_info, 
+    scopes=scopes
 )
 
-# Initialize both clients using the same scoped credentials
+# Initialize clients using the scoped credentials
 status.Initialize(credentials=credentials, project='modis-temperature-data')
 storage_client = storage.Client(credentials=credentials)
 
 BUCKET_NAME = os.environ['BUCKET_NAME']
 
 # ---------------------------------------
-# 2. DYNAMIC DATE LOGIC
+# 2. DATE LOGIC
 # ---------------------------------------
 now = status.Date(time.time() * 1000)
 end_date = status.Date(now.format("YYYY-MM-01"))
 start_date = end_date.advance(-1, 'month')
-month_label = start_date.format('MMM_YYYY').getInfo()
+month_label = start_date.format('YYYY-MM').getInfo()
 
-print(f"Running pipeline for: {month_label}")
+logging.info(f"Running pipeline for {month_label}")
 
 # ---------------------------------------
-# 3. LOAD DATA
+# 3. PROCESSING LOGIC
 # ---------------------------------------
 wards = status.FeatureCollection("projects/modis-temperature-data/assets/MDB_Wards_2020")
-provinces = [
-    "Limpopo", "Gauteng", "Mpumalanga", "North West", "Free State",
-    "KwaZulu-Natal", "Eastern Cape", "Western Cape", "Northern Cape"
-]
+provinces = ["Limpopo", "Gauteng", "Mpumalanga", "North West", "Free State", "KwaZulu-Natal", "Eastern Cape", "Western Cape", "Northern Cape"]
 
-pop_count_img = (
-    status.ImageCollection("WorldPop/GP/100m/pop")
-    .filterDate('2020-01-01', '2021-01-01')
-    .mean()
-    .rename('Population_Count')
-)
+pop_count_img = status.ImageCollection("WorldPop/GP/100m/pop").filterDate('2020-01-01', '2021-01-01').mean().rename('Population_Count')
 landcover = status.ImageCollection("ESA/WorldCover/v100").first()
 cropland = landcover.eq(40).rename('Agric_Percentage')
 
+def get_safe_data(collection, band, scale, offset_val, name):
+    coll = collection.select(band)
+    return status.Image(status.Algorithms.If(
+        coll.size().gt(0),
+        coll.mean().multiply(scale).add(offset_val).rename(name),
+        status.Image().rename(name).selfMask()
+    ))
+
 def process_province(province_name):
     province_fc = wards.filter(status.Filter.eq('Province', province_name))
-
-    def get_safe_data(collection, band, scale, offset_val, name):
-        coll = collection.select(band)
-        return status.Image(status.Algorithms.If(
-            coll.size().gt(0),
-            coll.mean().multiply(scale).add(offset_val).rename(name),
-            status.Image().rename(name).selfMask()
-        ))
-
-    lst = get_safe_data(
-        status.ImageCollection('MODIS/061/MOD11A1').filterDate(start_date, end_date),
-        'LST_Day_1km', 0.02, -273.15, 'LST_Surface_C'
-    )
-    ndvi = get_safe_data(
-        status.ImageCollection('MODIS/061/MOD13Q1').filterDate(start_date, end_date),
-        'NDVI', 0.0001, 0, 'Habitat_Vegetation_Index'
-    )
-
+    
+    lst = get_safe_data(status.ImageCollection('MODIS/061/MOD11A1').filterDate(start_date, end_date), 'LST_Day_1km', 0.02, -273.15, 'LST_Surface_Temp_C')
+    ndvi = get_safe_data(status.ImageCollection('MODIS/061/MOD13Q1').filterDate(start_date, end_date), 'NDVI', 0.0001, 0, 'NDVI_Vegetation_Index')
+    
     era5_coll = status.ImageCollection("ECMWF/ERA5_LAND/HOURLY").filterDate(start_date, end_date)
     era5 = status.Image(status.Algorithms.If(
         era5_coll.size().gt(0),
-        era5_coll.select(['temperature_2m', 'volumetric_soil_water_layer_1'])
-                 .mean()
-                 .subtract(status.Image([273.15, 0]))
-                 .rename(['Air_Temp_C', 'Soil_Moisture']),
-        status.Image.cat([
-            status.Image().rename('Air_Temp_C').selfMask(),
-            status.Image().rename('Soil_Moisture').selfMask()
-        ])
+        era5_coll.select(['temperature_2m', 'volumetric_soil_water_layer_1']).mean().subtract(status.Image([273.15, 0])).rename(['Air_Temp_C', 'Soil_Moisture']),
+        status.Image.cat([status.Image().rename('Air_Temp_C').selfMask(), status.Image().rename('Soil_Moisture').selfMask()])
     ))
 
     stack = lst.addBands([ndvi, era5, pop_count_img, cropland])
-
-    stats = (
-        stack.reduceRegions(collection=province_fc, reducer=status.Reducer.mean(), scale=1000)
-             .map(lambda f: f.set('Month', month_label))
-    )
-
-    def finalize(f):
-        return f.set({
-            'latitude': f.geometry().centroid().coordinates().get(1),
-            'longitude': f.geometry().centroid().coordinates().get(0),
-            'Population_Density_Per_KM2': status.Number(f.get('Population_Count')).multiply(100)
-        })
-
-    return stats.map(finalize)
+    stats = stack.reduceRegions(collection=province_fc, reducer=status.Reducer.mean(), scale=1000).map(lambda f: f.set('Month', month_label))
+    
+    return stats
 
 # ---------------------------------------
-# 4. EXPORT & DATABASE UPLOAD
+# 4. EXPORT TASKS
 # ---------------------------------------
 tasks = []
 for prov in provinces:
     prov_clean = prov.replace(' ', '_')
     filename = f"{prov_clean}_{month_label}"
     dataset = process_province(prov)
-
+    
     task = status.batch.Export.table.toCloudStorage(
         collection=dataset,
         description=f"Export_{filename}",
@@ -129,41 +101,55 @@ for prov in provinces:
     )
     task.start()
     tasks.append((task, filename))
-    print(f"Started GEE task for {prov}")
+    logging.info(f"Started GEE Task: {prov}")
 
-print("Waiting for Earth Engine tasks to complete...")
+# ---------------------------------------
+# 5. WAIT & DB UPLOAD
+# ---------------------------------------
 for task, filename in tasks:
     while task.active():
         time.sleep(30)
-
+    
     if task.status()['state'] == 'COMPLETED':
-        print(f"Uploading {filename} to AWS RDS...")
-
+        logging.info(f"Ingesting {filename}...")
         bucket = storage_client.bucket(BUCKET_NAME)
         blob = bucket.blob(f"pipeline_output/{filename}.csv")
         content = blob.download_as_text()
+        
+        df = pd.read_csv(StringIO(content))
+        
+        # Prepare for Database (malaria_observation table)
+        df_db = pd.DataFrame()
+        df_db['date_recorded'] = df['Month'] + "-01"
+        df_db['zone_id'] = pd.to_numeric(df['WardID'], errors='coerce')
+        df_db['lst_surface_temp_c'] = df['LST_Surface_Temp_C']
+        df_db['air_temp_c'] = df['Air_Temp_C']
+        df_db = df_db.dropna(subset=['zone_id'])
 
-        # Fix 3: Use io.StringIO instead of the removed pd.compat.StringIO
-        df = pd.read_csv(io.StringIO(content))
-        df = df.dropna(subset=['WardID'])
-
-        conn = psycopg2.connect(
-            host=os.environ['DB_HOST'],
-            database=os.environ['DB_NAME'],
-            user=os.environ['DB_USER'],
-            password=os.environ['DB_PASSWORD']
-        )
-        cursor = conn.cursor()
-        for _, row in df.iterrows():
-            cursor.execute(
-                """INSERT INTO malaria_data (month, ward_id, lst_c, air_temp)
-                   VALUES (%s, %s, %s, %s) ON CONFLICT DO NOTHING""",
-                (row['Month'], row['WardID'], row['LST_Surface_C'], row['Air_Temp_C'])
+        try:
+            conn = psycopg2.connect(
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASSWORD']
             )
-        conn.commit()
-        cursor.close()
-        conn.close()
-        print(f"Done: {filename}")
+            cursor = conn.cursor()
+            
+            # Use high-performance COPY
+            buffer = StringIO()
+            df_db.to_csv(buffer, index=False, header=False)
+            buffer.seek(0)
+            
+            cursor.copy_expert("""
+                COPY malaria_observation (date_recorded, zone_id, lst_surface_temp_c, air_temp_c) 
+                FROM STDIN WITH CSV
+            """, buffer)
+            
+            conn.commit()
+            cursor.close()
+            conn.close()
+            logging.info(f"Successfully uploaded {filename}")
+        except Exception as e:
+            logging.error(f"Database error on {filename}: {e}")
 
-    else:
-        print(f"FAILED: {filename} — state: {task.status()['state']}")
+logging.info("Monthly Pipeline Complete.")
