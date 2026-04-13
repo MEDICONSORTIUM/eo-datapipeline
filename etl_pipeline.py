@@ -12,6 +12,17 @@ from google.cloud import storage
 # ---------------------------------------
 # Load credentials from GitHub Secret
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
+
+
+scopes = [
+    'https://www.googleapis.com/auth/earthengine',
+    'https://www.googleapis.com/auth/cloud-platform'
+]
+
+credentials = service_account.Credentials.from_service_account_info(
+    service_account_info, 
+    scopes=scopes
+)
 credentials = service_account.Credentials.from_service_account_info(service_account_info)
 status.Initialize(credentials=credentials, project='modis-temperature-data')
 
