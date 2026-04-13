@@ -12,14 +12,19 @@ from google.cloud import storage
 # 1. AUTHENTICATION & INITIALIZATION
 # ---------------------------------------
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
-
-# Fix 1: Use ee.ServiceAccountCredentials instead of google-auth directly
-# This is the correct way to authenticate EE with a service account
-service_account_email = service_account_info['client_email']
-credentials = status.ServiceAccountCredentials(
-    email=service_account_email,
-    key_data=json.dumps(service_account_info)
+# AFTER — separate credentials for each client
+ee_credentials = service_account.Credentials.from_service_account_info(
+    service_account_info,
+    scopes=['https://www.googleapis.com/auth/earthengine']  # EE only — no cloud-platform
 )
+
+gcs_credentials = service_account.Credentials.from_service_account_info(
+    service_account_info,
+    scopes=['https://www.googleapis.com/auth/cloud-platform']  # GCS only
+)
+
+status.Initialize(credentials=ee_credentials, project='modis-temperature-data')
+storage_client = storage.Client(credentials=gcs_credentials)
 
 # Initialize Earth Engine
 status.Initialize(credentials=credentials, project='modis-temperature-data')
