@@ -9,27 +9,30 @@ from google.cloud import storage
 
 # ---------------------------------------
 # 1. AUTHENTICATION & INITIALIZATION
+
 # ---------------------------------------
-# Load credentials from GitHub Secret
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
 
-
+# 1. Define scopes
 scopes = [
     'https://www.googleapis.com/auth/earthengine',
     'https://www.googleapis.com/auth/cloud-platform'
 ]
 
+# 2. Create credentials WITH the scopes
 credentials = service_account.Credentials.from_service_account_info(
     service_account_info, 
     scopes=scopes
 )
-credentials = service_account.Credentials.from_service_account_info(service_account_info)
+
+# 3. Initialize status (Earth Engine)
 status.Initialize(credentials=credentials, project='modis-temperature-data')
 
-# Cloud Storage Client
+# 4. Initialize Cloud Storage Client
 storage_client = storage.Client(credentials=credentials)
-BUCKET_NAME = 'YOUR_BUCKET_NAME_HERE' 
 
+# 5. Get Bucket Name from GitHub Secrets
+BUCKET_NAME = os.environ['BUCKET_NAME']
 # ---------------------------------------
 # 2. DYNAMIC DATE LOGIC (Fetch Previous Month)
 # ---------------------------------------
