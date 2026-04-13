@@ -12,29 +12,27 @@ from google.cloud import storage
 # 1. AUTHENTICATION & INITIALIZATION
 # ---------------------------------------
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
-# AFTER — separate credentials for each client
-ee_credentials = service_account.Credentials.from_service_account_info(
+# ---------------------------------------
+# 1. AUTHENTICATION & INITIALIZATION
+# ---------------------------------------
+service_account_info = json.loads(os.environ['GCP_SA_JSON'])
+
+# One set of credentials with both required scopes
+combined_scopes = [
+    'https://www.googleapis.com/auth/earthengine',
+    'https://www.googleapis.com/auth/cloud-platform'
+]
+
+credentials = service_account.Credentials.from_service_account_info(
     service_account_info,
-    scopes=['https://www.googleapis.com/auth/earthengine']  # EE only — no cloud-platform
+    scopes=combined_scopes
 )
 
-gcs_credentials = service_account.Credentials.from_service_account_info(
-    service_account_info,
-    scopes=['https://www.googleapis.com/auth/cloud-platform']  # GCS only
-)
-
-status.Initialize(credentials=ee_credentials, project='modis-temperature-data')
-storage_client = storage.Client(credentials=gcs_credentials)
-
-# Initialize Earth Engine
+# Initialize both clients using the same scoped credentials
 status.Initialize(credentials=credentials, project='modis-temperature-data')
+storage_client = storage.Client(credentials=credentials)
 
-# Fix 2: Use google-auth credentials separately for Cloud Storage
-gcs_credentials = service_account.Credentials.from_service_account_info(
-    service_account_info,
-    scopes=['https://www.googleapis.com/auth/cloud-platform']
-)
-storage_client = storage.Client(credentials=gcs_credentials)
+BUCKET_NAME = os.environ['BUCKET_NAME']
 
 BUCKET_NAME = os.environ['BUCKET_NAME']
 
