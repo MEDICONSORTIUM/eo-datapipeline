@@ -1,0 +1,30 @@
+name: Monthly Malaria Pipeline
+
+on:
+  schedule:
+    - cron: '0 0 1 * *' # Runs at midnight on the 1st of every month
+  workflow_dispatch: # Allows you to run it manually for testing
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run Script
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_USER: ${{ secrets.DB_USER }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_NAME: ${{ secrets.DB_NAME }}
+        run: python etl_pipeline.py
