@@ -1,4 +1,4 @@
-name: Monthly Malaria Pipeline
+name: Data Pipeline
 
 on:
   schedule:
