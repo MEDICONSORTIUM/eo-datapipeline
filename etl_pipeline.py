@@ -121,55 +121,75 @@ for prov in provinces:
 # ---------------------------------------
 # 5. WAIT & DB UPLOAD
 # ---------------------------------------
-conn = psycopg2.connect(
-    host=os.environ['DB_HOST'],
-    database=os.environ['DB_NAME'],
-    user=os.environ['DB_USER'],
-    password=os.environ['DB_PASSWORD']
-)
+# ---------------------------------------
+# 5. WAIT & DB UPLOAD
+# ---------------------------------------
 
 for task, filename in tasks:
+    logging.info(f"Waiting for task: {filename}...")
+    
+    # Wait for the specific GEE task to finish
     while task.active():
         time.sleep(30)
 
-    state = task.status()['state']
+    status = task.status()
+    state = status['state']
 
     if state == 'FAILED':
-        logging.error(f"GEE task failed for {filename}: {task.status().get('error_message')}")
+        logging.error(f"GEE task failed for {filename}: {status.get('error_message')}")
         continue
 
     if state == 'COMPLETED':
-        logging.info(f"Ingesting {filename}...")
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob = bucket.blob(f"pipeline_output/{filename}.csv")
-        content = blob.download_as_text()
-
-        df = pd.read_csv(StringIO(content))
-
-        df_db = pd.DataFrame()
-        df_db['date_recorded'] = pd.to_datetime(
-            df['Month'] + '-01', format='%Y-%m-%d', errors='coerce'
-        )
-        df_db['zone_id'] = pd.to_numeric(df['WardID'], errors='coerce')
-        df_db['lst_surface_temp_c'] = df['LST_Surface_Temp_C']
-        df_db['air_temp_c'] = df['Air_Temp_C']
-        df_db = df_db.dropna(subset=['zone_id', 'date_recorded'])
-
+        logging.info(f"Task {filename} finished. Starting DB ingestion...")
+        
         try:
-            cursor = conn.cursor()
-            buffer = StringIO()
-            df_db.to_csv(buffer, index=False, header=False)
-            buffer.seek(0)
-            cursor.copy_expert("""
-                COPY malaria_observation (date_recorded, zone_id, lst_surface_temp_c, air_temp_c)
-                FROM STDIN WITH CSV
-            """, buffer)
-            conn.commit()
-            cursor.close()
-            logging.info(f"Successfully uploaded {filename}")
-        except Exception as e:
-            conn.rollback()
-            logging.error(f"Database error on {filename}: {e}")
+            # 1. Download from GCS
+            bucket = storage_client.bucket(BUCKET_NAME)
+            blob = bucket.blob(f"pipeline_output/{filename}.csv")
+            content = blob.download_as_text()
+            df = pd.read_csv(StringIO(content))
 
-conn.close()
+            # 2. Data Preparation
+            df_db = pd.DataFrame()
+            df_db['date_recorded'] = pd.to_datetime(
+                df['Month'] + '-01', format='%Y-%m-%d', errors='coerce'
+            )
+            df_db['zone_id'] = pd.to_numeric(df['WardID'], errors='coerce')
+            df_db['lst_surface_temp_c'] = df['LST_Surface_Temp_C']
+            df_db['air_temp_c'] = df['Air_Temp_C']
+            df_db = df_db.dropna(subset=['zone_id', 'date_recorded'])
+
+            # 3. Database Ingestion (Open connection ONLY when ready)
+            conn = psycopg2.connect(
+                host=os.environ['DB_HOST'],
+                database=os.environ['DB_NAME'],
+                user=os.environ['DB_USER'],
+                password=os.environ['DB_PASSWORD'],
+                connect_timeout=10
+            )
+            
+            try:
+                with conn: # Automatically commits at end of block
+                    with conn.cursor() as cursor:
+                        buffer = StringIO()
+                        df_db.to_csv(buffer, index=False, header=False)
+                        buffer.seek(0)
+                        cursor.copy_expert("""
+                            COPY malaria_observation (date_recorded, zone_id, lst_surface_temp_c, air_temp_c)
+                            FROM STDIN WITH CSV
+                        """, buffer)
+                logging.info(f"Successfully uploaded {filename}")
+            
+            except Exception as db_e:
+                # Check if connection is still alive before rolling back
+                if conn and not conn.closed:
+                    conn.rollback()
+                logging.error(f"Database error on {filename}: {db_e}")
+            finally:
+                if conn:
+                    conn.close()
+
+        except Exception as e:
+            logging.error(f"Processing error on {filename}: {e}")
+
 logging.info("Monthly Pipeline Complete.")
