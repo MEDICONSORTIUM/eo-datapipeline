@@ -6,13 +6,9 @@ import logging
 import pandas as pd
 import psycopg2
 from io import StringIO
-from google.oauth2 import service_account
 from google.cloud import storage
-import google.auth.transport.requests
+from google.oauth2 import service_account
 
-# ---------------------------------------
-# 0. LOGGING SETUP
-# ---------------------------------------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 # ---------------------------------------
@@ -20,23 +16,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # ---------------------------------------
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
 
-scopes = [
-    'https://www.googleapis.com/auth/earthengine',
-    'https://www.googleapis.com/auth/cloud-platform'
-]
-
-credentials = service_account.Credentials.from_service_account_info(
-    service_account_info,
-    scopes=scopes
+# Use EE's own credential class — avoids the internal scope conflict
+# that occurs when using google.oauth2.Credentials with the discovery client
+ee_credentials = ee.ServiceAccountCredentials(
+    email=service_account_info['client_email'],
+    key_data=json.dumps(service_account_info)
 )
+ee.Initialize(ee_credentials, project='modis-temperature-data')
 
-# Pre-refresh token before EE's internal client tries to negotiate it
-request = google.auth.transport.requests.Request()
-credentials.refresh(request)
+# Separate credentials for GCS (google.oauth2 is fine here)
+gcs_credentials = service_account.Credentials.from_service_account_info(
+    service_account_info,
+    scopes=['https://www.googleapis.com/auth/cloud-platform']
+)
+storage_client = storage.Client(credentials=gcs_credentials)
 
-ee.Initialize(credentials=credentials, project='modis-temperature-data')
-storage_client = storage.Client(credentials=credentials)
+BUCKET_NAME = os.environ['BUCKET_NAME']
 
+# ... rest of the script unchanged
 BUCKET_NAME = os.environ['BUCKET_NAME']
 
 # ---------------------------------------
