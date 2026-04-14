@@ -119,47 +119,35 @@ for prov in provinces:
     logging.info(f"Started GEE Task: {prov}")
 
 # ---------------------------------------
-# 5. WAIT & DB UPLOAD
+# 5. WAIT & DB UPLOAD (With Zone Seeding)
 # ---------------------------------------
-# ---------------------------------------
-# 5. WAIT & DB UPLOAD
-# ---------------------------------------
+from psycopg2.extras import execute_batch
 
 for task, filename in tasks:
     logging.info(f"Waiting for task: {filename}...")
     
-    # Wait for the specific GEE task to finish
     while task.active():
         time.sleep(30)
 
     status = task.status()
-    state = status['state']
-
-    if state == 'FAILED':
-        logging.error(f"GEE task failed for {filename}: {status.get('error_message')}")
-        continue
-
-    if state == 'COMPLETED':
+    if status['state'] == 'COMPLETED':
         logging.info(f"Task {filename} finished. Starting DB ingestion...")
         
         try:
             # 1. Download from GCS
             bucket = storage_client.bucket(BUCKET_NAME)
             blob = bucket.blob(f"pipeline_output/{filename}.csv")
-            content = blob.download_as_text()
-            df = pd.read_csv(StringIO(content))
+            df = pd.read_csv(StringIO(blob.download_as_text()))
 
             # 2. Data Preparation
             df_db = pd.DataFrame()
-            df_db['date_recorded'] = pd.to_datetime(
-                df['Month'] + '-01', format='%Y-%m-%d', errors='coerce'
-            )
+            df_db['date_recorded'] = pd.to_datetime(df['Month'] + '-01')
             df_db['zone_id'] = pd.to_numeric(df['WardID'], errors='coerce')
             df_db['lst_surface_temp_c'] = df['LST_Surface_Temp_C']
             df_db['air_temp_c'] = df['Air_Temp_C']
             df_db = df_db.dropna(subset=['zone_id', 'date_recorded'])
 
-            # 3. Database Ingestion (Open connection ONLY when ready)
+            # 3. Database Ingestion
             conn = psycopg2.connect(
                 host=os.environ['DB_HOST'],
                 database=os.environ['DB_NAME'],
@@ -169,25 +157,35 @@ for task, filename in tasks:
             )
             
             try:
-                with conn: # Automatically commits at end of block
+                with conn:
                     with conn.cursor() as cursor:
-                        buffer = StringIO()
-                        df_db.to_csv(buffer, index=False, header=False)
-                        buffer.seek(0)
-                        cursor.copy_expert("""
-                            COPY malaria_observation (date_recorded, zone_id, lst_surface_temp_c, air_temp_c)
-                            FROM STDIN WITH CSV
-                        """, buffer)
+                        # --- STEP A: Populate 'zone' table first ---
+                        unique_zones = df_db[['zone_id']].drop_duplicates()
+                        zone_tuples = [tuple(x) for x in unique_zones.to_numpy()]
+                        
+                        logging.info(f"Seeding {len(zone_tuples)} zones for {filename}...")
+                        execute_batch(cursor, """
+                            INSERT INTO zone (zone_id) 
+                            VALUES (%s) 
+                            ON CONFLICT (zone_id) DO NOTHING
+                        """, zone_tuples)
+
+                        # --- STEP B: Insert weather data ---
+                        logging.info(f"Inserting weather observations...")
+                        obs_tuples = [tuple(x) for x in df_db.to_numpy()]
+                        query = """
+                            INSERT INTO malaria_observation (date_recorded, zone_id, lst_surface_temp_c, air_temp_c)
+                            VALUES (%s, %s, %s, %s)
+                        """
+                        execute_batch(cursor, query, obs_tuples, page_size=1000)
+                        
                 logging.info(f"Successfully uploaded {filename}")
             
             except Exception as db_e:
-                # Check if connection is still alive before rolling back
-                if conn and not conn.closed:
-                    conn.rollback()
+                if conn and not conn.closed: conn.rollback()
                 logging.error(f"Database error on {filename}: {db_e}")
             finally:
-                if conn:
-                    conn.close()
+                if conn: conn.close()
 
         except Exception as e:
             logging.error(f"Processing error on {filename}: {e}")
