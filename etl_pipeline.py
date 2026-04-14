@@ -8,31 +8,30 @@ import psycopg2
 from io import StringIO
 from google.oauth2 import service_account
 from google.cloud import storage
+import ee
+import os
+import json
+from google.oauth2 import service_account
+import google.auth.transport.requests
 
-# ---------------------------------------
-# 0. LOGGING SETUP
-# ---------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# ---------------------------------------
-# 1. AUTHENTICATION & INITIALIZATION
-# ---------------------------------------
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
 
-# Define BOTH scopes in one list to avoid the 'invalid_scope' error
 scopes = [
     'https://www.googleapis.com/auth/earthengine',
     'https://www.googleapis.com/auth/cloud-platform'
 ]
 
-# Create ONE credentials object for both EE and GCS
 credentials = service_account.Credentials.from_service_account_info(
-    service_account_info, 
+    service_account_info,
     scopes=scopes
 )
 
-# Initialize clients using the scoped credentials
-status.Initialize(credentials=credentials, project='modis-temperature-data')
+# Proactively refresh before handing to EE — this validates the token
+# exchange works before Initialize tries to use it internally
+request = google.auth.transport.requests.Request()
+credentials.refresh(request)
+
+ee.Initialize(credentials=credentials, project='modis-temperature-data')
 storage_client = storage.Client(credentials=credentials)
 
 BUCKET_NAME = os.environ['BUCKET_NAME']
