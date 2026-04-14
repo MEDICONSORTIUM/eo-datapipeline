@@ -10,29 +10,22 @@ from google.cloud import storage
 from google.oauth2 import service_account
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-# ---------------------------------------
-# 1. AUTHENTICATION & INITIALIZATION
-# ---------------------------------------
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
 
-# Define the specific scopes needed for both GEE and GCS
+# You MUST define these scopes explicitly for the 'invalid_scope' error to go away
 SCOPES = [
     'https://www.googleapis.com/auth/earthengine',
     'https://www.googleapis.com/auth/cloud-platform'
 ]
 
-# Create a single credential object for everything
 credentials = service_account.Credentials.from_service_account_info(
     service_account_info, 
     scopes=SCOPES
 )
 
-# Initialize Earth Engine with the unified credentials
-ee.Initialize(
-    credentials=credentials, 
-    project='modis-temperature-data'
-)
+# Use these credentials to initialize
+ee.Initialize(credentials=credentials, project='modis-temperature-data')
+
 
 # Initialize GCS with the same credentials
 storage_client = storage.Client(credentials=credentials)
