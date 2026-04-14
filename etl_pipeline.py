@@ -16,24 +16,27 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 # ---------------------------------------
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
 
-# Use EE's own credential class — avoids the internal scope conflict
-# that occurs when using google.oauth2.Credentials with the discovery client
-ee_credentials = ee.ServiceAccountCredentials(
-    email=service_account_info['client_email'],
-    key_data=json.dumps(service_account_info)
+# Define the specific scopes needed for both GEE and GCS
+SCOPES = [
+    'https://www.googleapis.com/auth/earthengine',
+    'https://www.googleapis.com/auth/cloud-platform'
+]
+
+# Create a single credential object for everything
+credentials = service_account.Credentials.from_service_account_info(
+    service_account_info, 
+    scopes=SCOPES
 )
-ee.Initialize(ee_credentials, project='modis-temperature-data')
 
-# Separate credentials for GCS (google.oauth2 is fine here)
-gcs_credentials = service_account.Credentials.from_service_account_info(
-    service_account_info,
-    scopes=['https://www.googleapis.com/auth/cloud-platform']
+# Initialize Earth Engine with the unified credentials
+ee.Initialize(
+    credentials=credentials, 
+    project='modis-temperature-data'
 )
-storage_client = storage.Client(credentials=gcs_credentials)
 
-BUCKET_NAME = os.environ['BUCKET_NAME']
+# Initialize GCS with the same credentials
+storage_client = storage.Client(credentials=credentials)
 
-# ... rest of the script unchanged
 BUCKET_NAME = os.environ['BUCKET_NAME']
 
 # ---------------------------------------
