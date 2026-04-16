@@ -1,10 +1,12 @@
 import ee
 import os
+import sys
 import json
 import time
 import logging
 import pandas as pd
 import psycopg2
+from psycopg2.extras import execute_batch
 from io import StringIO
 from google.cloud import storage
 from google.oauth2 import service_account
@@ -25,7 +27,6 @@ credentials = service_account.Credentials.from_service_account_info(
 
 # Use these credentials to initialize
 ee.Initialize(credentials=credentials, project='modis-temperature-data')
-
 
 # Initialize GCS with the same credentials
 storage_client = storage.Client(credentials=credentials)
@@ -119,10 +120,8 @@ for prov in provinces:
     logging.info(f"Started GEE Task: {prov}")
 
 # ---------------------------------------
-# 5. WAIT & DB UPLOAD (With Zone Seeding)
+# 5. WAIT & DB UPLOAD (With Schema Fixes)
 # ---------------------------------------
-from psycopg2.extras import execute_batch
-
 for task, filename in tasks:
     logging.info(f"Waiting for task: {filename}...")
     
@@ -139,13 +138,29 @@ for task, filename in tasks:
             blob = bucket.blob(f"pipeline_output/{filename}.csv")
             df = pd.read_csv(StringIO(blob.download_as_text()))
 
-            # 2. Data Preparation
+            # 2. Data Preparation & Casting
             df_db = pd.DataFrame()
             df_db['date_recorded'] = pd.to_datetime(df['Month'] + '-01')
             df_db['zone_id'] = pd.to_numeric(df['WardID'], errors='coerce')
-            df_db['lst_surface_temp_c'] = df['LST_Surface_Temp_C']
-            df_db['air_temp_c'] = df['Air_Temp_C']
+            
+            # Drop invalid zones and explicitly cast to integer for PostgreSQL
             df_db = df_db.dropna(subset=['zone_id', 'date_recorded'])
+            df_db['zone_id'] = df_db['zone_id'].astype(int)
+
+            # Safely extract supplementary columns if they exist
+            df_db['lst_surface_temp_c'] = df.get('LST_Surface_Temp_C', None)
+            df_db['air_temp_c'] = df.get('Air_Temp_C', None)
+            df_db['soil_moisture_pct'] = df.get('Soil_Moisture', None)
+            df_db['ndvi_vegetation_index'] = df.get('NDVI_Vegetation_Index', None)
+            df_db['agric_percentage'] = df.get('Agric_Percentage', None)
+
+            # Map fields for the `zone` table specifically
+            df_zone = pd.DataFrame()
+            df_zone['zone_id'] = df_db['zone_id']
+            # Fallback to formatting the ID if WardName isn't in the GeoJSON/CSV
+            df_zone['zone_name'] = df.get('WardName', 'Ward ' + df['WardID'].astype(str)) 
+            df_zone['base_population'] = pd.to_numeric(df.get('Population_Count'), errors='coerce').fillna(0).astype(int)
+            df_zone = df_zone.drop_duplicates(subset=['zone_id'])
 
             # 3. Database Ingestion
             conn = psycopg2.connect(
@@ -159,23 +174,34 @@ for task, filename in tasks:
             try:
                 with conn:
                     with conn.cursor() as cursor:
-                        # --- STEP A: Populate 'zone' table first ---
-                        unique_zones = df_db[['zone_id']].drop_duplicates()
-                        zone_tuples = [tuple(x) for x in unique_zones.to_numpy()]
+                        # --- STEP A: Populate 'zone' table first to satisfy Foreign Keys ---
+                        zone_tuples = [tuple(x) for x in df_zone[['zone_id', 'zone_name', 'base_population']].to_numpy()]
                         
                         logging.info(f"Seeding {len(zone_tuples)} zones for {filename}...")
                         execute_batch(cursor, """
-                            INSERT INTO zone (zone_id) 
-                            VALUES (%s) 
+                            INSERT INTO zone (zone_id, zone_name, base_population) 
+                            VALUES (%s, %s, %s) 
                             ON CONFLICT (zone_id) DO NOTHING
                         """, zone_tuples)
 
-                        # --- STEP B: Insert weather data ---
-                        logging.info(f"Inserting weather observations...")
-                        obs_tuples = [tuple(x) for x in df_db.to_numpy()]
+                        # --- STEP B: Insert detailed weather observations ---
+                        logging.info("Inserting weather observations...")
+                        obs_cols = ['date_recorded', 'zone_id', 'lst_surface_temp_c', 'air_temp_c', 
+                                    'soil_moisture_pct', 'ndvi_vegetation_index', 'agric_percentage']
+                        obs_tuples = [tuple(x) for x in df_db[obs_cols].to_numpy()]
+                        
                         query = """
-                            INSERT INTO malaria_observation (date_recorded, zone_id, lst_surface_temp_c, air_temp_c)
-                            VALUES (%s, %s, %s, %s)
+                            INSERT INTO malaria_observation 
+                                (date_recorded, zone_id, lst_surface_temp_c, air_temp_c, 
+                                 soil_moisture_pct, ndvi_vegetation_index, agric_percentage)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                            ON CONFLICT (zone_id, date_recorded) 
+                            DO UPDATE SET 
+                                lst_surface_temp_c = EXCLUDED.lst_surface_temp_c,
+                                air_temp_c = EXCLUDED.air_temp_c,
+                                soil_moisture_pct = EXCLUDED.soil_moisture_pct,
+                                ndvi_vegetation_index = EXCLUDED.ndvi_vegetation_index,
+                                agric_percentage = EXCLUDED.agric_percentage
                         """
                         execute_batch(cursor, query, obs_tuples, page_size=1000)
                         
@@ -184,10 +210,12 @@ for task, filename in tasks:
             except Exception as db_e:
                 if conn and not conn.closed: conn.rollback()
                 logging.error(f"Database error on {filename}: {db_e}")
+                sys.exit(1) # Ensure GitHub Actions recognizes this job failed
             finally:
                 if conn: conn.close()
 
         except Exception as e:
             logging.error(f"Processing error on {filename}: {e}")
+            sys.exit(1)
 
 logging.info("Monthly Pipeline Complete.")
