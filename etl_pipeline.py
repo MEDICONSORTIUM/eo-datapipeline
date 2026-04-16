@@ -196,6 +196,8 @@ for task, filename in tasks:
             df_zone = pd.DataFrame()
             df_zone['zone_id'] = df_db['zone_id']
             df_zone['zone_name'] = df.get('WardLabel', 'Ward ' + df['WardID'].astype(str)) 
+            df_zone['municipality_name'] = df['Municipali'].astype(str)
+            df_zone['province_name'] = df['Province'].astype(str)
             df_zone['base_population'] = pd.to_numeric(df.get('Population_Count'), errors='coerce').fillna(0).astype(int)
             df_zone['dominant_habitat_code'] = df.get('Habitat_Class_Code').astype(str)
             df_zone['external_zone_id'] = df['WardID'].astype(str)
@@ -223,21 +225,25 @@ for task, filename in tasks:
                     with conn.cursor() as cursor:
                         
                         # --- STEP A: UPSERT 'zone' table ---
+                       # --- UPSERT 'zone' table ---
                         zone_cols = [
-                            'zone_id', 'zone_name', 'base_population', 'dominant_habitat_code', 
-                            'external_zone_id', 'zone_type', 'latitude', 'longitude', 'population_density_per_km2'
+                            'zone_id', 'zone_name', 'municipality_name', 'province_name', 
+                            'base_population', 'dominant_habitat_code', 'external_zone_id', 
+                            'zone_type', 'latitude', 'longitude', 'population_density_per_km2'
                         ]
                         zone_tuples = [tuple(x) for x in df_zone[zone_cols].to_numpy()]
                         
-                        logging.info(f"Seeding {len(zone_tuples)} zones for {filename}...")
                         execute_batch(cursor, """
                             INSERT INTO zone (
-                                zone_id, zone_name, base_population, dominant_habitat_code, 
-                                external_zone_id, zone_type, latitude, longitude, population_density_per_km2
+                                zone_id, zone_name, municipality_name, province_name,
+                                base_population, dominant_habitat_code, external_zone_id, 
+                                zone_type, latitude, longitude, population_density_per_km2
                             ) 
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) 
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) 
                             ON CONFLICT (zone_id) DO UPDATE SET 
                                 zone_name = EXCLUDED.zone_name,
+                                municipality_name = EXCLUDED.municipality_name,
+                                province_name = EXCLUDED.province_name,
                                 base_population = EXCLUDED.base_population,
                                 dominant_habitat_code = EXCLUDED.dominant_habitat_code,
                                 external_zone_id = EXCLUDED.external_zone_id,
