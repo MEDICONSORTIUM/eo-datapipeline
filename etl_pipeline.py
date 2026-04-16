@@ -5,7 +5,6 @@ import json
 import time
 import logging
 import pandas as pd
-import numpy as np
 import psycopg2
 from psycopg2.extras import execute_batch
 from io import StringIO
@@ -13,6 +12,10 @@ from google.cloud import storage
 from google.oauth2 import service_account
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+# ---------------------------------------
+# 0. AUTHENTICATION & SETUP
+# ---------------------------------------
 service_account_info = json.loads(os.environ['GCP_SA_JSON'])
 
 SCOPES = [
@@ -142,7 +145,7 @@ for prov in provinces:
         fileNamePrefix=f"pipeline_output/{filename}",
         fileFormat='CSV',
         selectors=[
-            'Month', 'WardID', 'WardLabel', 'latitude', 'longitude', 
+            'Month', 'WardID', 'WardLabel', 'Municipali', 'Province', 'latitude', 'longitude', 
             'LST_Surface_Temp_C', 'Air_Temp_C', 'Soil_Moisture', 'NDWI_Water', 
             'NDVI_Vegetation_Index', 'Agric_Percentage', 'Population_Density_Per_KM2', 
             'Population_Count', 'Habitat_Class_Code'
@@ -195,9 +198,12 @@ for task, filename in tasks:
             # ---------------------------------------
             df_zone = pd.DataFrame()
             df_zone['zone_id'] = df_db['zone_id']
-            df_zone['zone_name'] = df.get('WardLabel', 'Ward ' + df['WardID'].astype(str)) 
-            df_zone['municipality_name'] = df['Municipali'].astype(str)
-            df_zone['province_name'] = df['Province'].astype(str)
+            
+            # Use df.get to safely retrieve name columns without crashing if missing
+            df_zone['zone_name'] = df.get('WardLabel', 'Ward ' + df['WardID'].astype(str)).astype(str)
+            df_zone['municipality_name'] = df.get('Municipali', '').astype(str)
+            df_zone['province_name'] = df.get('Province', '').astype(str)
+            
             df_zone['base_population'] = pd.to_numeric(df.get('Population_Count'), errors='coerce').fillna(0).astype(int)
             df_zone['dominant_habitat_code'] = df.get('Habitat_Class_Code').astype(str)
             df_zone['external_zone_id'] = df['WardID'].astype(str)
@@ -225,7 +231,6 @@ for task, filename in tasks:
                     with conn.cursor() as cursor:
                         
                         # --- STEP A: UPSERT 'zone' table ---
-                       # --- UPSERT 'zone' table ---
                         zone_cols = [
                             'zone_id', 'zone_name', 'municipality_name', 'province_name', 
                             'base_population', 'dominant_habitat_code', 'external_zone_id', 
