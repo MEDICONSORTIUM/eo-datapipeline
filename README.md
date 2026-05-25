@@ -285,16 +285,16 @@ pytest tests/ -v --tb=short
 
 ```bash
 # GEE composition logic only
-pytest tests/test_unit.py -v
+pytest test_unit.py -v
 
 # DataFrame transforms + GCS loader
-pytest tests/test_integration_transforms.py -v
+pytest test_integration_transforms.py -v
 
 # PostgreSQL upsert logic
-pytest tests/test_integration_db.py -v
+pytest test_integration_db.py -v
 
 # Full end-to-end flow
-pytest tests/test_e2e_pipeline.py -v
+pytest test_e2e_pipeline.py -v
 ```
 
 ### Expected Output
