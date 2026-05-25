@@ -215,8 +215,8 @@ One row per ward per month. Composite primary key: `(zone_id, date_recorded)`.
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/med-consortium/eoha-pipeline.git
-cd eoha-pipeline
+git clone https://github.com/MedICONSORTIUM/eoha-datapipeline.git
+cd eoha-datapipeline
 ```
 
 ### Install Dependencies
@@ -278,23 +278,24 @@ pip install pytest pandas psycopg2-binary
 ### Run All Tests
 
 ```bash
-pytest tests/ -v --tb=short
+pytest -v --tb=short
 ```
+
 
 ### Run by Layer
 
 ```bash
 # GEE composition logic only
-pytest tests/test_unit.py -v
+pytest test_unit.py -v
 
 # DataFrame transforms + GCS loader
-pytest tests/test_integration_transforms.py -v
+pytest test_integration_transforms.py -v
 
 # PostgreSQL upsert logic
-pytest tests/test_integration_db.py -v
+pytest test_integration_db.py -v
 
 # Full end-to-end flow
-pytest tests/test_e2e_pipeline.py -v
+pytest test_e2e_pipeline.py -v
 ```
 
 ### Expected Output
