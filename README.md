@@ -1,3 +1,42 @@
+## Current EOHA database connection
+
+Install dependencies with `python -m pip install -r requirements.txt`, then run
+`python database.py` from this folder. The connection loads `.env` beside
+`database.py`; existing environment variables take precedence. Keep `.env`
+out of Git (it is ignored).
+
+Set `DB_HOST` to the RDS hostname, `DB_NAME=eoha`, `DB_USER` to your database user,
+and `DB_PASSWORD` to your password. Optional settings are `DB_PORT=5432` and
+`DB_SSLMODE=require`.
+
+The check uses a read-only transaction and validates columns and table write
+permissions for `eoha.data_sources`, `eoha.environmental_variables`,
+`eoha.regions`, `eoha.environmental_observations`, and `eoha.etl_runs`.
+Connections use `search_path=eoha,public`. The check does not insert or change data.
+
+Do not use `--init`: it is disabled because `schema.sql` describes the old
+`public.zone` and `public.malaria_observation` tables, not the schema in RDS.
+
+`etl_pipeline.py` writes wards to `eoha.regions`, stores each measurement in
+`eoha.environmental_observations`, and records every attempt in `eoha.etl_runs`.
+It also keeps the source and variable reference rows up to date.
+
+Before a full run, process three wards with:
+
+```powershell
+python etl_pipeline.py --smoke-test --province Limpopo
+```
+
+Use `--month YYYY-MM` to select a month. A smoke-test CSV is removed after it is
+loaded. Normal monthly CSV exports remain in the bucket.
+
+Run local tests with `python -m unittest discover -s tests -v`.
+These use mocks and need no database or Google credentials. The older project
+description below documents the legacy pipeline; its separate testable module
+and advertised 98-test suite are absent from this checkout.
+
+---
+
 <div align="center">
 
 <br />

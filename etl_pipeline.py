@@ -1,393 +1,423 @@
-import ee
-import os
-import sys
+"""Monthly Earth Engine pipeline for the EOHA PostgreSQL database."""
+
+import argparse
 import json
-import time
 import logging
-import pandas as pd
-import psycopg2
-from psycopg2.extras import execute_batch
+import os
+import time
+from datetime import date
 from io import StringIO
+from pathlib import Path
+
+import ee
+import pandas as pd
+from dotenv import load_dotenv
 from google.cloud import storage
 from google.oauth2 import service_account
+from psycopg2.extras import execute_batch, execute_values
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-
-
-# -------------------------------------------------------
-# STEP 0: AUTHENTICATE WITH GOOGLE CLOUD AND EARTH ENGINE
-# -------------------------------------------------------
-
-service_account_info = json.loads(os.environ['GCP_SA_JSON'])
-
-credentials = service_account.Credentials.from_service_account_info(
-    service_account_info,
-    scopes=[
-        'https://www.googleapis.com/auth/earthengine',
-        'https://www.googleapis.com/auth/cloud-platform'
-    ]
-)
-
-ee.Initialize(credentials=credentials, project='modis-temperature-data')
-
-storage_client = storage.Client(credentials=credentials)
-
-BUCKET_NAME = os.environ['BUCKET_NAME']
+from database import check_database, connect_database
 
 
-# -------------------------------------------------------
-# STEP 1: WORK OUT WHICH MONTH WE ARE PROCESSING
-# -------------------------------------------------------
-
-# Get the first day of the current month as the end date,
-# and the first day of the previous month as the start date.
-now        = ee.Date(time.time() * 1000)
-end_date   = ee.Date(now.format("YYYY-MM-01"))
-start_date = end_date.advance(-1, 'month')
-
-# month_label will be something like "2025-03", used in filenames and the database.
-month_label = start_date.format('YYYY-MM').getInfo()
-
-logging.info(f"Running pipeline for month: {month_label}")
-
-
-# -------------------------------------------------------
-# STEP 2: LOAD SHARED EARTH ENGINE ASSETS
-# -------------------------------------------------------
-
-# South African ward boundaries (used as the analysis units).
-wards = ee.FeatureCollection("projects/modis-temperature-data/assets/MDB_Wards_2020")
-
-provinces = [
-    "Limpopo", "Gauteng", "Mpumalanga", "North West", "Free State",
-    "KwaZulu-Natal", "Eastern Cape", "Western Cape", "Northern Cape"
+PROJECT_ID = 'modis-temperature-data'
+WARD_ASSET = f'projects/{PROJECT_ID}/assets/MDB_Wards_2020'
+PROVINCES = [
+    'Limpopo', 'Gauteng', 'Mpumalanga', 'North West', 'Free State',
+    'KwaZulu-Natal', 'Eastern Cape', 'Western Cape', 'Northern Cape',
 ]
 
-# Population count raster (WorldPop 2020).
-population_image = (
-    ee.ImageCollection("WorldPop/GP/100m/pop")
-    .filterDate('2020-01-01', '2021-01-01')
-    .mean()
-    .rename('Population_Count')
-)
+SOURCE_ROWS = [
+    ('MODIS_LST', 'MODIS Land Surface Temperature', 'NASA',
+     'MODIS/061/MOD11A1', 'satellite', 'daily', '1 km'),
+    ('MODIS_NDVI', 'MODIS Vegetation Indices', 'NASA',
+     'MODIS/061/MOD13Q1', 'satellite', '16 day', '250 m'),
+    ('MODIS_REFLECTANCE', 'MODIS Surface Reflectance', 'NASA',
+     'MODIS/061/MOD09GA', 'satellite', 'daily', '500 m'),
+    ('ERA5_LAND', 'ERA5-Land', 'ECMWF',
+     'ECMWF/ERA5_LAND/HOURLY', 'reanalysis', 'hourly', '9 km'),
+    ('WORLDCOVER', 'ESA WorldCover', 'ESA',
+     'ESA/WorldCover/v100', 'satellite', 'annual', '10 m'),
+    ('WORLDPOP', 'WorldPop', 'WorldPop',
+     'WorldPop/GP/100m/R2025A/v1/pop', 'population', 'annual', '100 m'),
+]
 
-# Land cover classification (ESA WorldCover).
-landcover_image = ee.ImageCollection("ESA/WorldCover/v100").first()
+VARIABLE_ROWS = [
+    ('lst_c', 'Land Surface Temperature', '°C', 'Thermal'),
+    ('air_temp_c', 'Air Temperature', '°C', 'Thermal'),
+    ('soil_moisture', 'Soil Moisture', 'm3/m3', 'Moisture'),
+    ('ndvi', 'Normalized Difference Vegetation Index', 'index', 'Vegetation'),
+    ('ndwi', 'Normalized Difference Water Index', 'index', 'Hydrology'),
+    ('agriculture_fraction', 'Agricultural Land Fraction', 'fraction', 'Land Cover'),
+    ('population', 'Population', 'persons', 'Population'),
+    ('land_cover', 'Land Cover', 'class', 'Land Cover'),
+]
 
-# A binary image: 1 where land cover is cropland (class 40), 0 elsewhere.
-cropland_image = landcover_image.eq(40).rename('Agric_Percentage')
+MEASUREMENTS = [
+    ('LST_Surface_Temp_C', 'lst_c', 'MODIS_LST'),
+    ('Air_Temp_C', 'air_temp_c', 'ERA5_LAND'),
+    ('Soil_Moisture', 'soil_moisture', 'ERA5_LAND'),
+    ('NDVI_Vegetation_Index', 'ndvi', 'MODIS_NDVI'),
+    ('NDWI_Water', 'ndwi', 'MODIS_REFLECTANCE'),
+    ('Agric_Percentage', 'agriculture_fraction', 'WORLDCOVER'),
+    ('Population_Count', 'population', 'WORLDPOP'),
+    ('Habitat_Class_Code', 'land_cover', 'WORLDCOVER'),
+]
 
-# The raw habitat class codes (used to find the most common habitat per ward).
-habitat_image = landcover_image.select('Map').rename('Habitat_Code')
-
-
-# -------------------------------------------------------
-# STEP 3: DEFINE HOW TO BUILD SATELLITE IMAGES SAFELY
-# -------------------------------------------------------
-
-def build_safe_band_image(image_collection, band_name, scale_factor, offset, output_name):
-    """
-    Returns a single image for the given band by averaging the collection.
-    Applies a scale factor and offset to convert raw values to real units.
-    If the collection has no images for the month, returns a blank masked image
-    instead of crashing.
-    """
-    filtered = image_collection.select(band_name)
-
-    has_data = filtered.size().gt(0)
-
-    image_with_data    = filtered.mean().multiply(scale_factor).add(offset).rename(output_name)
-    image_without_data = ee.Image().rename(output_name).selfMask()
-
-    return ee.Image(ee.Algorithms.If(has_data, image_with_data, image_without_data))
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 
-# -------------------------------------------------------
-# STEP 4: DEFINE HOW TO PROCESS ONE PROVINCE
-# -------------------------------------------------------
+def create_google_clients(project_id):
+    """Connect to Earth Engine and Cloud Storage."""
+    service_account_json = os.environ.get('GCP_SA_JSON')
+    if service_account_json:
+        info = json.loads(service_account_json)
+        credentials = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=[
+                'https://www.googleapis.com/auth/earthengine',
+                'https://www.googleapis.com/auth/cloud-platform',
+            ],
+        )
+        ee.Initialize(credentials=credentials, project=project_id)
+    else:
+        ee.Initialize(project=project_id)
+        credentials = ee.data.get_persistent_credentials()
+    return storage.Client(project=project_id, credentials=credentials)
 
-def process_province(province_name):
-    """
-    For a given province, builds a stacked satellite image covering the month,
-    then reduces it to per-ward statistics. Returns a FeatureCollection where
-    each feature is one ward with all its environmental indicators attached.
-    """
 
-    province_wards = wards.filter(ee.Filter.eq('Province', province_name))
+def month_range(month_text=None):
+    """Return the first day of a month and the first day of the next month."""
+    if month_text:
+        start = date.fromisoformat(f'{month_text}-01')
+    else:
+        today = date.today()
+        current = date(today.year, today.month, 1)
+        start = date(current.year - 1, 12, 1) if current.month == 1 else date(current.year, current.month - 1, 1)
+    end = date(start.year + 1, 1, 1) if start.month == 12 else date(start.year, start.month + 1, 1)
+    return start, end
 
-    # --- Land Surface Temperature (MODIS MOD11A1) ---
-    lst_collection = ee.ImageCollection('MODIS/061/MOD11A1').filterDate(start_date, end_date)
-    lst_image = build_safe_band_image(lst_collection, 'LST_Day_1km', 0.02, -273.15, 'LST_Surface_Temp_C')
 
-    # --- Vegetation Index (MODIS MOD13Q1) ---
-    ndvi_collection = ee.ImageCollection('MODIS/061/MOD13Q1').filterDate(start_date, end_date)
-    ndvi_image = build_safe_band_image(ndvi_collection, 'NDVI', 0.0001, 0, 'NDVI_Vegetation_Index')
+def safe_mean(collection, band, scale, offset, name):
+    """Return a scaled monthly mean, or a masked image when no data exists."""
+    selected = collection.select(band)
+    with_data = selected.mean().multiply(scale).add(offset).rename(name)
+    without_data = ee.Image().rename(name).selfMask()
+    return ee.Image(ee.Algorithms.If(selected.size().gt(0), with_data, without_data))
 
-    # --- Water Index (MODIS MOD09GA, computed as a normalised difference) ---
-    ndwi_collection = ee.ImageCollection('MODIS/061/MOD09GA').filterDate(start_date, end_date)
 
-    ndwi_has_data     = ndwi_collection.size().gt(0)
-    ndwi_with_data    = ndwi_collection.map(lambda img: img.normalizedDifference(['sur_refl_b04', 'sur_refl_b02'])).mean().rename('NDWI_Water')
-    ndwi_without_data = ee.Image().rename('NDWI_Water').selfMask()
-    ndwi_image = ee.Image(ee.Algorithms.If(ndwi_has_data, ndwi_with_data, ndwi_without_data))
+def build_ward_data(start, end, province, ward_limit=None):
+    """Build monthly environmental values for wards in one province."""
+    wards = ee.FeatureCollection(WARD_ASSET).filter(ee.Filter.eq('Province', province))
+    if ward_limit:
+        wards = wards.limit(ward_limit)
 
-    # --- Air Temperature and Soil Moisture (ERA5 reanalysis) ---
-    era5_collection = ee.ImageCollection("ECMWF/ERA5_LAND/HOURLY").filterDate(start_date, end_date)
+    lst = safe_mean(
+        ee.ImageCollection('MODIS/061/MOD11A1').filterDate(str(start), str(end)),
+        'LST_Day_1km', 0.02, -273.15, 'LST_Surface_Temp_C',
+    )
+    ndvi = safe_mean(
+        ee.ImageCollection('MODIS/061/MOD13Q1').filterDate(str(start), str(end)),
+        'NDVI', 0.0001, 0, 'NDVI_Vegetation_Index',
+    )
 
-    era5_has_data = era5_collection.size().gt(0)
-    era5_with_data = (
-        era5_collection
-        .select(['temperature_2m', 'volumetric_soil_water_layer_1'])
+    reflectance = ee.ImageCollection('MODIS/061/MOD09GA').filterDate(str(start), str(end))
+    ndwi_value = reflectance.map(
+        lambda image: image.normalizedDifference(['sur_refl_b04', 'sur_refl_b02'])
+    ).mean().rename('NDWI_Water')
+    ndwi_blank = ee.Image().rename('NDWI_Water').selfMask()
+    ndwi = ee.Image(ee.Algorithms.If(reflectance.size().gt(0), ndwi_value, ndwi_blank))
+
+    era5 = ee.ImageCollection('ECMWF/ERA5_LAND/HOURLY').filterDate(str(start), str(end))
+    era5_value = (
+        era5.select(['temperature_2m', 'volumetric_soil_water_layer_1'])
         .mean()
-        .subtract(ee.Image([273.15, 0]))          # Convert Kelvin to Celsius for temperature
+        .subtract(ee.Image([273.15, 0]))
         .rename(['Air_Temp_C', 'Soil_Moisture'])
     )
-    era5_without_data = ee.Image.cat([
+    era5_blank = ee.Image.cat([
         ee.Image().rename('Air_Temp_C').selfMask(),
-        ee.Image().rename('Soil_Moisture').selfMask()
+        ee.Image().rename('Soil_Moisture').selfMask(),
     ])
-    era5_image = ee.Image(ee.Algorithms.If(era5_has_data, era5_with_data, era5_without_data))
+    era5_image = ee.Image(ee.Algorithms.If(era5.size().gt(0), era5_value, era5_blank))
 
-    # --- Stack all bands into one image ---
-    full_stack = lst_image.addBands([ndvi_image, ndwi_image, era5_image, population_image, cropland_image])
-
-    # --- Calculate the mean value of each band for every ward polygon ---
-    ward_means = (
-        full_stack
-        .reduceRegions(collection=province_wards, reducer=ee.Reducer.mean(), scale=1000)
-        .map(lambda feature: feature.set('Month', month_label))
+    worldcover = ee.ImageCollection('ESA/WorldCover/v100').first()
+    agriculture = worldcover.eq(40).rename('Agric_Percentage')
+    habitat = worldcover.select('Map')
+    population = (
+        ee.ImageCollection('WorldPop/GP/100m/R2025A/v1/pop')
+        .filter(ee.Filter.eq('country', 'ZAF'))
+        .filter(ee.Filter.eq('year', 2020))
+        .mean()
+        .select('population')
+        .rename('Population_Count')
     )
 
-    # --- Find the most common habitat class in each ward ---
-    ward_habitat_modes = habitat_image.reduceRegions(
-        collection=province_wards,
-        reducer=ee.Reducer.mode(),
-        scale=1000
+    values = lst.addBands([ndvi, ndwi, era5_image, agriculture, population])
+    reduced = values.reduceRegions(wards, ee.Reducer.mean(), 1000)
+    habitat_values = habitat.reduceRegions(wards, ee.Reducer.mode(), 1000)
+    joined = ee.Join.saveFirst('habitat').apply(
+        reduced,
+        habitat_values,
+        ee.Filter.equals(leftField='WardID', rightField='WardID'),
     )
+    month_text = start.strftime('%Y-%m')
 
-    # --- Join the habitat mode result back onto the main ward statistics ---
-    joined_results = ee.Join.saveFirst('habitat_data').apply(
-        ward_means,
-        ward_habitat_modes,
-        ee.Filter.equals(leftField='WardID', rightField='WardID')
-    )
-
-    # --- Add a few extra computed fields to each ward feature ---
-    def add_extra_fields(feature):
-        centroid  = feature.geometry().centroid()
-        latitude  = centroid.coordinates().get(1)
-        longitude = centroid.coordinates().get(0)
-
-        habitat_code = ee.Feature(feature.get('habitat_data')).get('mode')
-
-        # WorldPop gives population per 100m pixel, so multiply by 100 to get per km².
-        population_density = ee.Number(feature.get('Population_Count')).multiply(100)
-
+    def add_fields(feature):
+        feature = ee.Feature(feature)
+        centroid = feature.geometry().centroid()
+        habitat_feature = ee.Feature(feature.get('habitat'))
         return feature.set({
-            'Habitat_Class_Code':         habitat_code,
-            'Population_Density_Per_KM2': population_density,
-            'latitude':                   latitude,
-            'longitude':                  longitude
+            'Month': month_text,
+            'Habitat_Class_Code': habitat_feature.get('mode'),
+            'latitude': centroid.coordinates().get(1),
+            'longitude': centroid.coordinates().get(0),
         })
 
-    return joined_results.map(add_extra_fields)
+    return ee.FeatureCollection(joined).map(add_fields)
 
 
-# -------------------------------------------------------
-# STEP 5: START AN EXPORT TASK FOR EACH PROVINCE
-# -------------------------------------------------------
-
-# These are the columns we want in the exported CSV file.
-export_columns = [
-    'Month', 'WardID', 'WardLabel', 'Municipali', 'Province',
-    'latitude', 'longitude',
-    'LST_Surface_Temp_C', 'Air_Temp_C', 'Soil_Moisture',
-    'NDWI_Water', 'NDVI_Vegetation_Index',
-    'Agric_Percentage', 'Population_Density_Per_KM2',
-    'Population_Count', 'Habitat_Class_Code'
-]
-
-tasks = []
-
-for province_name in provinces:
-    province_slug = province_name.replace(' ', '_')
-    filename      = f"{province_slug}_{month_label}"
-    ward_data     = process_province(province_name)
-
+def export_to_storage(collection, bucket_name, filename):
+    """Start one Earth Engine CSV export."""
+    selectors = [
+        'Month', 'WardID', 'WardLabel', 'Municipali', 'District', 'Province',
+        'latitude', 'longitude', 'LST_Surface_Temp_C', 'Air_Temp_C',
+        'Soil_Moisture', 'NDWI_Water', 'NDVI_Vegetation_Index',
+        'Agric_Percentage', 'Population_Count', 'Habitat_Class_Code',
+    ]
     task = ee.batch.Export.table.toCloudStorage(
-        collection=ward_data,
-        description=f"Export_{filename}",
-        bucket=BUCKET_NAME,
-        fileNamePrefix=f"pipeline_output/{filename}",
+        collection=collection,
+        description=f'Export_{filename}',
+        bucket=bucket_name,
+        fileNamePrefix=f'pipeline_output/{filename}',
         fileFormat='CSV',
-        selectors=export_columns
+        selectors=selectors,
     )
     task.start()
-    tasks.append((task, filename))
-
-    logging.info(f"Export task started for: {province_name}")
+    return task
 
 
-# -------------------------------------------------------
-# STEP 6: WAIT FOR EACH TASK TO FINISH, THEN LOAD INTO DB
-# -------------------------------------------------------
-
-for task, filename in tasks:
-
-    # Poll until the Earth Engine task is done.
-    logging.info(f"Waiting for task to finish: {filename}")
+def wait_for_export(task, poll_seconds=20):
+    """Wait for an Earth Engine export and raise a clear error on failure."""
     while task.active():
-        time.sleep(30)
-
-    if task.status()['state'] != 'COMPLETED':
-        logging.error(f"Task failed: {filename}  Status: {task.status()}")
-        sys.exit(1)
-
-    logging.info(f"Task finished: {filename}. Loading into database...")
-
-    try:
-        # Read the exported CSV from Google Cloud Storage into a DataFrame.
-        bucket = storage_client.bucket(BUCKET_NAME)
-        blob   = bucket.blob(f"pipeline_output/{filename}.csv")
-        df     = pd.read_csv(StringIO(blob.download_as_text()))
+        time.sleep(poll_seconds)
+    status = task.status()
+    if status.get('state') != 'COMPLETED':
+        message = status.get('error_message', status)
+        raise RuntimeError(f'Earth Engine export failed: {message}')
 
 
-        # ---------------------------------------------------
-        # BUILD THE 'zone' TABLE ROWS
-        # ---------------------------------------------------
-        # Each row represents one ward with its geographic and demographic info.
+def build_region_rows(frame):
+    """Convert an exported CSV into region rows."""
+    rows = []
+    for _, item in frame.iterrows():
+        ward_id = item.get('WardID')
+        if pd.isna(ward_id):
+            continue
+        code = str(ward_id).removesuffix('.0')
+        name = item.get('WardLabel')
+        if pd.isna(name) or not str(name).strip():
+            name = f'Ward {code}'
+        rows.append((
+            code, str(name), 'Ward',
+            None if pd.isna(item.get('Province')) else str(item.get('Province')),
+        ))
+    return rows
 
-        zone_id               = pd.to_numeric(df['WardID'], errors='coerce')
-        zone_name             = df.get('WardLabel', 'Ward ' + df['WardID'].astype(str)).astype(str)
-        municipality_name     = df.get('Municipali', '').astype(str)
-        province_name_col     = df.get('Province', '').astype(str)
-        base_population       = pd.to_numeric(df.get('Population_Count'), errors='coerce').fillna(0).astype(int)
-        dominant_habitat_code = df.get('Habitat_Class_Code').astype(str)
-        external_zone_id      = df['WardID'].astype(str)
-        latitude              = pd.to_numeric(df.get('latitude'),  errors='coerce')
-        longitude             = pd.to_numeric(df.get('longitude'), errors='coerce')
-        population_density    = pd.to_numeric(df.get('Population_Density_Per_KM2'), errors='coerce')
 
-        df_zone = pd.DataFrame({
-            'zone_id':                    zone_id,
-            'zone_name':                  zone_name,
-            'municipality_name':          municipality_name,
-            'province_name':              province_name_col,
-            'base_population':            base_population,
-            'dominant_habitat_code':      dominant_habitat_code,
-            'external_zone_id':           external_zone_id,
-            'zone_type':                  'Ward',
-            'latitude':                   latitude,
-            'longitude':                  longitude,
-            'population_density_per_km2': population_density,
+def build_observation_rows(frame, month_start, etl_run_id):
+    """Convert wide Earth Engine output into normalized observation rows."""
+    rows = []
+    for _, item in frame.iterrows():
+        ward_id = item.get('WardID')
+        if pd.isna(ward_id):
+            continue
+        region_code = str(ward_id).removesuffix('.0')
+        metadata = json.dumps({
+            'municipality': None if pd.isna(item.get('Municipali')) else item.get('Municipali'),
+            'district': None if pd.isna(item.get('District')) else item.get('District'),
+            'latitude': None if pd.isna(item.get('latitude')) else item.get('latitude'),
+            'longitude': None if pd.isna(item.get('longitude')) else item.get('longitude'),
         })
-
-        # Remove rows with no ward ID, and drop duplicate wards.
-        df_zone = df_zone.dropna(subset=['zone_id'])
-        df_zone = df_zone.drop_duplicates(subset=['zone_id'])
-        df_zone['zone_id'] = df_zone['zone_id'].astype(int)
-
-        # Replace NaN with None so PostgreSQL receives NULL instead of a string "NaN".
-        df_zone = df_zone.where(pd.notnull(df_zone), None)
-
-
-        # ---------------------------------------------------
-        # BUILD THE 'malaria_observation' TABLE ROWS
-        # ---------------------------------------------------
-        # Each row represents one ward's environmental readings for the month.
-
-        df_obs = pd.DataFrame({
-            'date_recorded':         pd.to_datetime(df['Month'] + '-01'),
-            'zone_id':               zone_id,
-            'lst_surface_temp_c':    df.get('LST_Surface_Temp_C'),
-            'air_temp_c':            df.get('Air_Temp_C'),
-            'soil_moisture_pct':     df.get('Soil_Moisture'),
-            'ndvi_vegetation_index': df.get('NDVI_Vegetation_Index'),
-            'ndwi_water_index':      df.get('NDWI_Water'),
-            'agric_percentage':      df.get('Agric_Percentage'),
-        })
-
-        df_obs = df_obs.dropna(subset=['zone_id', 'date_recorded'])
-        df_obs['zone_id'] = df_obs['zone_id'].astype(int)
-        df_obs = df_obs.where(pd.notnull(df_obs), None)
+        for column, variable_code, source_code in MEASUREMENTS:
+            value = pd.to_numeric(item.get(column), errors='coerce')
+            rows.append((
+                region_code, variable_code, source_code, month_start,
+                None if pd.isna(value) else float(value), etl_run_id, metadata,
+            ))
+    return rows
 
 
-        # ---------------------------------------------------
-        # INSERT BOTH TABLES INTO POSTGRESQL
-        # ---------------------------------------------------
+def ensure_reference_data(cursor):
+    """Add or update the sources and variables used by this pipeline."""
+    execute_batch(cursor, '''
+        INSERT INTO eoha.data_sources (
+            source_code, source_name, provider, dataset_id, source_type,
+            temporal_resolution, spatial_resolution
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (source_code) DO UPDATE SET
+            source_name = EXCLUDED.source_name,
+            provider = EXCLUDED.provider,
+            dataset_id = EXCLUDED.dataset_id,
+            source_type = EXCLUDED.source_type,
+            temporal_resolution = EXCLUDED.temporal_resolution,
+            spatial_resolution = EXCLUDED.spatial_resolution,
+            active = TRUE
+    ''', SOURCE_ROWS)
+    execute_batch(cursor, '''
+        INSERT INTO eoha.environmental_variables (
+            variable_code, variable_name, unit, category
+        ) VALUES (%s, %s, %s, %s)
+        ON CONFLICT (variable_code) DO UPDATE SET
+            variable_name = EXCLUDED.variable_name,
+            unit = EXCLUDED.unit,
+            category = EXCLUDED.category
+    ''', VARIABLE_ROWS)
 
-        connection = psycopg2.connect(
-            host=os.environ['DB_HOST'],
-            database=os.environ['DB_NAME'],
-            user=os.environ['DB_USER'],
-            password=os.environ['DB_PASSWORD'],
-            connect_timeout=10
+
+def start_etl_run(connection, month_start, smoke_test):
+    """Create an ETL run record and return its ID."""
+    with connection, connection.cursor() as cursor:
+        ensure_reference_data(cursor)
+        cursor.execute('''
+            INSERT INTO eoha.etl_runs (observation_month, metadata)
+            VALUES (%s, %s::jsonb)
+            RETURNING etl_run_id
+        ''', (month_start, json.dumps({'smoke_test': smoke_test})))
+        return cursor.fetchone()[0]
+
+
+def write_frame(cursor, frame, month_start, etl_run_id):
+    """Write one exported frame with an existing database cursor."""
+    region_rows = build_region_rows(frame)
+    observation_rows = build_observation_rows(frame, month_start, etl_run_id)
+    execute_batch(cursor, '''
+        INSERT INTO eoha.regions (
+            region_code, region_name, region_type, province, geometry
+        ) VALUES (%s, %s, %s, %s, NULL)
+        ON CONFLICT (region_code) DO UPDATE SET
+            region_name = EXCLUDED.region_name,
+            region_type = EXCLUDED.region_type,
+            province = EXCLUDED.province,
+            geometry = EXCLUDED.geometry,
+            updated_at = NOW()
+    ''', region_rows)
+
+    results = execute_values(cursor, '''
+        INSERT INTO eoha.environmental_observations (
+            region_id, variable_id, data_source_id, observation_month,
+            statistic, value, etl_run_id, metadata
         )
+        SELECT r.region_id, v.variable_id, s.data_source_id, input.observation_month,
+               'mean', input.value, input.etl_run_id, input.metadata::jsonb
+        FROM (VALUES %s) AS input (
+            region_code, variable_code, source_code, observation_month,
+            value, etl_run_id, metadata
+        )
+        JOIN eoha.regions r ON r.region_code = input.region_code
+        JOIN eoha.environmental_variables v ON v.variable_code = input.variable_code
+        JOIN eoha.data_sources s ON s.source_code = input.source_code
+        ON CONFLICT (region_id, variable_id, data_source_id, observation_month, statistic)
+        DO UPDATE SET
+            value = EXCLUDED.value,
+            etl_run_id = EXCLUDED.etl_run_id,
+            metadata = EXCLUDED.metadata,
+            updated_at = NOW()
+        RETURNING (xmax = 0)
+    ''', observation_rows, page_size=1000, fetch=True)
 
-        try:
-            with connection:
-                with connection.cursor() as cursor:
+    inserted = sum(1 for result in results if result[0])
+    return inserted, len(results) - inserted
 
-                    # Insert or update zone rows.
-                    zone_rows = [tuple(row) for row in df_zone[[
-                        'zone_id', 'zone_name', 'municipality_name', 'province_name',
-                        'base_population', 'dominant_habitat_code', 'external_zone_id',
-                        'zone_type', 'latitude', 'longitude', 'population_density_per_km2'
-                    ]].to_numpy()]
 
-                    execute_batch(cursor, """
-                        INSERT INTO zone (
-                            zone_id, zone_name, municipality_name, province_name,
-                            base_population, dominant_habitat_code, external_zone_id,
-                            zone_type, latitude, longitude, population_density_per_km2
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (zone_id) DO UPDATE SET
-                            zone_name                  = EXCLUDED.zone_name,
-                            municipality_name          = EXCLUDED.municipality_name,
-                            province_name              = EXCLUDED.province_name,
-                            base_population            = EXCLUDED.base_population,
-                            dominant_habitat_code      = EXCLUDED.dominant_habitat_code,
-                            external_zone_id           = EXCLUDED.external_zone_id,
-                            latitude                   = EXCLUDED.latitude,
-                            longitude                  = EXCLUDED.longitude,
-                            population_density_per_km2 = EXCLUDED.population_density_per_km2
-                    """, zone_rows)
+def load_frame(connection, frame, month_start, etl_run_id):
+    """Upsert one exported frame and return inserted and updated counts."""
+    with connection, connection.cursor() as cursor:
+        return write_frame(cursor, frame, month_start, etl_run_id)
 
-                    # Insert or update observation rows.
-                    obs_rows = [tuple(row) for row in df_obs[[
-                        'date_recorded', 'zone_id', 'lst_surface_temp_c', 'air_temp_c',
-                        'soil_moisture_pct', 'ndvi_vegetation_index', 'ndwi_water_index', 'agric_percentage'
-                    ]].to_numpy()]
 
-                    execute_batch(cursor, """
-                        INSERT INTO malaria_observation (
-                            date_recorded, zone_id, lst_surface_temp_c, air_temp_c,
-                            soil_moisture_pct, ndvi_vegetation_index, ndwi_water_index, agric_percentage
-                        )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                        ON CONFLICT (zone_id, date_recorded) DO UPDATE SET
-                            lst_surface_temp_c    = EXCLUDED.lst_surface_temp_c,
-                            air_temp_c            = EXCLUDED.air_temp_c,
-                            soil_moisture_pct     = EXCLUDED.soil_moisture_pct,
-                            ndvi_vegetation_index = EXCLUDED.ndvi_vegetation_index,
-                            ndwi_water_index      = EXCLUDED.ndwi_water_index,
-                            agric_percentage      = EXCLUDED.agric_percentage
-                    """, obs_rows, page_size=1000)
+def finish_etl_run(connection, etl_run_id, status, inserted, updated, error=None):
+    """Store the final status and counts for an ETL run."""
+    with connection, connection.cursor() as cursor:
+        cursor.execute('''
+            UPDATE eoha.etl_runs
+            SET run_finished_at = NOW(), status = %s,
+                records_inserted = %s, records_updated = %s,
+                records_failed = %s, error_message = %s
+            WHERE etl_run_id = %s
+        ''', (status, inserted, updated, 1 if error else 0, error, etl_run_id))
 
-            logging.info(f"Successfully loaded into database: {filename}")
 
-        except Exception as db_error:
-            connection.rollback()
-            logging.error(f"Database error while processing {filename}: {db_error}")
-            sys.exit(1)
+def parse_args(arguments=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--month', help='Month to process, for example 2026-09.')
+    parser.add_argument('--province', choices=PROVINCES, help='Process only one province.')
+    parser.add_argument('--smoke-test', action='store_true', help='Process three wards only.')
+    parser.add_argument('--bucket', help='Cloud Storage bucket; overrides BUCKET_NAME.')
+    return parser.parse_args(arguments)
 
-        finally:
-            connection.close()
 
+def main(arguments=()):
+    args = parse_args(arguments)
+    load_dotenv(Path(__file__).with_name('.env'), override=False)
+    project_id = os.environ.get('GCP_PROJECT', PROJECT_ID)
+    bucket_name = args.bucket or os.environ.get('BUCKET_NAME')
+    if not bucket_name:
+        raise ValueError('Set BUCKET_NAME or pass --bucket.')
+
+    connection = connect_database()
+    etl_run_id = None
+    inserted = 0
+    updated = 0
+    try:
+        with connection:
+            database_name, username = check_database(connection)
+        logging.info('Database ready: %s (user: %s)', database_name, username)
+
+        storage_client = create_google_clients(project_id)
+        bucket = storage_client.bucket(bucket_name)
+        if not bucket.exists():
+            raise ValueError(f'Cloud Storage bucket not found: {bucket_name}')
+
+        start, end = month_range(args.month)
+        etl_run_id = start_etl_run(connection, start, args.smoke_test)
+        provinces = [args.province] if args.province else PROVINCES
+        if args.smoke_test and not args.province:
+            provinces = [PROVINCES[0]]
+
+        tasks = []
+        for province in provinces:
+            slug = province.replace(' ', '_')
+            suffix = '_smoke' if args.smoke_test else ''
+            filename = f'{slug}_{start:%Y-%m}{suffix}'
+            collection = build_ward_data(start, end, province, 3 if args.smoke_test else None)
+            task = export_to_storage(collection, bucket_name, filename)
+            tasks.append((task, filename))
+            logging.info('Export started: %s', filename)
+
+        for task, filename in tasks:
+            wait_for_export(task)
+            blob = bucket.blob(f'pipeline_output/{filename}.csv')
+            frame = pd.read_csv(StringIO(blob.download_as_text()))
+            new_rows, changed_rows = load_frame(connection, frame, start, etl_run_id)
+            inserted += new_rows
+            updated += changed_rows
+            logging.info('Loaded %s: %s observations', filename, len(frame) * len(MEASUREMENTS))
+            if args.smoke_test:
+                blob.delete()
+
+        finish_etl_run(connection, etl_run_id, 'SUCCESS', inserted, updated)
+        logging.info('Pipeline complete. Inserted: %s, updated: %s', inserted, updated)
     except Exception as error:
-        logging.error(f"Error while processing {filename}: {error}")
-        sys.exit(1)
+        if etl_run_id is not None:
+            finish_etl_run(connection, etl_run_id, 'FAILED', inserted, updated, str(error))
+        raise
+    finally:
+        connection.close()
 
 
-logging.info("Monthly pipeline complete.")
+if __name__ == '__main__':
+    try:
+        main(None)
+    except Exception as error:
+        logging.error('Pipeline failed: %s', error)
+        raise SystemExit(1)
