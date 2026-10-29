@@ -86,7 +86,55 @@ class TestNcdPipeline(unittest.TestCase):
         finish_run.assert_called_once()
         self.assertEqual(finish_run.call_args.args[2], "FAILED")
         build_collection.assert_not_called()
-        connection.close.assert_called_once()
+        self.assertEqual(connection.close.call_count, 2)
+
+    @patch("ncd.pipeline.create_google_clients")
+    @patch("ncd.pipeline.ncd_database.load_observations", return_value=(24, 0))
+    @patch("ncd.pipeline.ncd_database.start_run", return_value=12)
+    @patch("ncd.pipeline.ncd_database.check_database")
+    @patch("ncd.pipeline.connect_database")
+    def test_database_connections_are_short_lived(
+        self,
+        connect_database,
+        check_database,
+        start_run,
+        load_observations,
+        create_google_clients,
+    ):
+        """
+        test_database_connections_are_short_lived()
+        -------------------------------------------
+        Export waiting cannot leave one database connection idle long enough to expire.
+
+        Parameters:
+        -----------
+        mocked services : MagicMock
+
+        Returns:
+        --------
+        void - asserts start, load, and finish each use a fresh connection.
+        """
+        connections = [MagicMock(), MagicMock(), MagicMock()]
+        connect_database.side_effect = connections
+        bucket = create_google_clients.return_value.bucket.return_value
+        bucket.exists.return_value = True
+        bucket.blob.return_value.download_as_text.return_value = "WardID\n1\n"
+        observations = [object()] * 24
+
+        with patch.dict(os.environ, {"BUCKET_NAME": "ncd-bucket"}, clear=True), \
+             patch.object(pipeline, "load_dotenv"), \
+             patch.object(pipeline, "build_ward_collection"), \
+             patch.object(pipeline, "export_to_storage", return_value=MagicMock()), \
+             patch.object(pipeline, "wait_for_export"), \
+             patch.object(pipeline, "build_observation_frame", return_value=observations), \
+             patch.object(pipeline.ncd_database, "finish_run") as finish_run:
+            pipeline.main(["--month", "2026-01", "--province", "Limpopo"])
+
+        self.assertEqual(connect_database.call_count, 3)
+        for connection in connections:
+            connection.close.assert_called_once()
+        load_observations.assert_called_once_with(connections[1], observations)
+        finish_run.assert_called_once_with(connections[2], 12, "SUCCESS", 24, 0, 0)
 
 
 if __name__ == "__main__":

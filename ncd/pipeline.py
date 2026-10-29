@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+from contextlib import contextmanager
 from datetime import date
 from io import StringIO
 from pathlib import Path
@@ -55,6 +56,16 @@ def _write_manifest(bucket, prefix, content):
     manifest.upload_from_string(json.dumps(content, indent=2, sort_keys=True), "application/json")
 
 
+@contextmanager
+def _database_connection():
+    """Open a short-lived database connection for one pipeline operation."""
+    connection = connect_database()
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
 def main(arguments=None):
     """Run the approved NCD pipeline without changing malaria tables."""
     args = parse_args(arguments)
@@ -74,14 +85,16 @@ def main(arguments=None):
     if args.smoke_test and not args.province:
         provinces = [PROVINCES[0]]
 
-    connection = connect_database()
     etl_run_id = None
     inserted = 0
     updated = 0
     failed = 0
     try:
-        ncd_database.check_database(connection)
-        etl_run_id = ncd_database.start_run(connection, start, args.province, args.smoke_test)
+        with _database_connection() as connection:
+            ncd_database.check_database(connection)
+            etl_run_id = ncd_database.start_run(
+                connection, start, args.province, args.smoke_test
+            )
 
         storage_client = create_google_clients(os.environ.get("GCP_PROJECT", PROJECT_ID))
         bucket = storage_client.bucket(bucket_name)
@@ -110,7 +123,10 @@ def main(arguments=None):
             observations = build_observation_frame(
                 frame, start, end, etl_run_id, include_annual=include_annual
             )
-            new_rows, changed_rows = ncd_database.load_observations(connection, observations)
+            with _database_connection() as connection:
+                new_rows, changed_rows = ncd_database.load_observations(
+                    connection, observations
+                )
             inserted += new_rows
             updated += changed_rows
             _write_manifest(
@@ -129,20 +145,29 @@ def main(arguments=None):
             )
             logging.info("NCD load complete for %s: %s observations", province, len(observations))
 
-        ncd_database.finish_run(
-            connection, etl_run_id, "SUCCESS", inserted, updated, failed
-        )
+        with _database_connection() as connection:
+            ncd_database.finish_run(
+                connection, etl_run_id, "SUCCESS", inserted, updated, failed
+            )
         logging.info("NCD pipeline complete. Inserted: %s, updated: %s", inserted, updated)
     except Exception as error:
         failed += 1
         if etl_run_id is not None:
             final_status = "PARTIAL" if inserted or updated else "FAILED"
-            ncd_database.finish_run(
-                connection, etl_run_id, final_status, inserted, updated, failed, str(error)
-            )
+            try:
+                with _database_connection() as connection:
+                    ncd_database.finish_run(
+                        connection,
+                        etl_run_id,
+                        final_status,
+                        inserted,
+                        updated,
+                        failed,
+                        str(error),
+                    )
+            except Exception as status_error:
+                logging.error("Could not record NCD run failure: %s", status_error)
         raise
-    finally:
-        connection.close()
 
 
 if __name__ == "__main__":
