@@ -1,5 +1,10 @@
 ## Current EOHA database connection
 
+The approved, separate NCD environmental pipeline is documented in
+[`NCD_PIPELINE.md`](./NCD_PIPELINE.md). Its SQL migration is prepared but not
+applied, its exports use the `ncd/` prefix, and its GitHub Actions schedule is
+disabled until a reviewed live smoke test passes.
+
 Install dependencies with `python -m pip install -r requirements.txt`, then run
 `python database.py` from this folder. The connection loads `.env` beside
 `database.py`; existing environment variables take precedence. Keep `.env`
