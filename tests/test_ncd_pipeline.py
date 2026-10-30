@@ -53,6 +53,47 @@ class TestNcdPipeline(unittest.TestCase):
         task = to_storage.return_value
         earth_engine.export_to_storage(MagicMock(), "bucket", "ncd/2026-01/file")
         task.start.assert_called_once()
+        selectors = to_storage.call_args.kwargs["selectors"]
+        self.assertTrue({"Municipali", "District", "latitude", "longitude"}.issubset(selectors))
+
+
+class TestSatelliteMeanAndCount(unittest.TestCase):
+    """Satellite coverage uses per-pixel counts on a common ward support."""
+
+    @patch("ncd.earth_engine._mean_and_count")
+    def test_expected_samples_are_counted_before_cloud_filter(self, mean_and_count):
+        """
+        test_expected_samples_are_counted_before_cloud_filter()
+        -------------------------------------------------------
+        Coverage compares available local samples against the cloud-filtered set.
+
+        Parameters:
+        -----------
+        mean_and_count : MagicMock
+
+        Returns:
+        --------
+        void - asserts raw and filtered collections remain separate and zeros count.
+        """
+        collection = MagicMock()
+        filtered, available = MagicMock(), MagicMock()
+        mean_and_count.side_effect = [filtered, available]
+        earth_engine._satellite_mean_and_count(
+            collection, "gas_band", "gas", "gas_expected", earth_engine._quality_mask_no2
+        )
+        collection.map.assert_called_once_with(earth_engine._quality_mask_no2)
+        self.assertEqual(mean_and_count.call_args_list[0].args,
+                         (collection.map.return_value, "gas_band", "gas"))
+        self.assertEqual(mean_and_count.call_args_list[1].args,
+                         (collection, "gas_band", "gas"))
+        filtered.select("gas_samples").unmask.assert_called_once_with(0, False)
+        available.select("gas_samples").unmask.assert_called_once_with(0, False)
+        available.select("gas_samples").unmask.return_value.rename.assert_called_once_with("gas_expected")
+        collection.size.assert_not_called()
+
+
+class TestNcdPipelineFailures(unittest.TestCase):
+    """External-service failures retain run records and short-lived connections."""
 
     @patch("ncd.pipeline.create_google_clients")
     @patch("ncd.pipeline.ncd_database.start_run", return_value=11)

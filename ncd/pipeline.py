@@ -134,6 +134,7 @@ def main(arguments=None):
                 prefix,
                 {
                     "boundary_version": "MDB_Wards_2020",
+                    "satellite_coverage_method": "ward_mean_counts_before_after_cloud_filter",
                     "include_annual": include_annual,
                     "method_version": "ncd-v1",
                     "observation_rows": len(observations),

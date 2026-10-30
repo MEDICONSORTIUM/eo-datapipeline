@@ -38,6 +38,11 @@ def _number(item, column):
     return None if pd.isna(value) else float(value)
 
 
+def _text(item, column):
+    value = item.get(column)
+    return None if pd.isna(value) or value is None else str(value)
+
+
 def _period(requested_start, requested_end, frequency):
     if frequency == "annual":
         return date(requested_start.year, 1, 1), date(requested_start.year + 1, 1, 1)
@@ -99,11 +104,18 @@ def build_observation_frame(frame, requested_start, requested_end, etl_run_id, i
                 requested_start, requested_end, indicator["frequency"]
             )
             metadata = {
+                "municipality": _text(item, "Municipali"),
+                "district": _text(item, "District"),
+                "latitude": _number(item, "latitude"),
+                "longitude": _number(item, "longitude"),
                 "frequency": indicator["frequency"],
                 "minimum_coverage": indicator["minimum_coverage"],
                 "source_version": SOURCE_VERSIONS[indicator["source_code"]],
                 "period_end_is_exclusive": True,
+                "expected_sample_count": expected,
             }
+            if indicator["source_code"] in {"S5P_NO2_OFFL", "S5P_SO2_OFFL"}:
+                metadata["coverage_method"] = "ward_mean_counts_before_after_cloud_filter"
             rows.append(
                 {
                     "region_code": region_code,

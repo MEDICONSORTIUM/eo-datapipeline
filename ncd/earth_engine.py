@@ -72,6 +72,19 @@ def _quality_mask_so2(image):
     return image.updateMask(image.select("cloud_fraction").lte(0.30))
 
 
+def _satellite_mean_and_count(collection, band, output_name, expected_name, quality_mask):
+    """Count local source samples before and after the additional cloud filter."""
+    filtered = _mean_and_count(collection.map(quality_mask), band, output_name)
+    available = _mean_and_count(collection, band, output_name)
+    # Zero counts must participate in both ward means, including fully masked pixels.
+    # Collection.size() counts unrelated orbits elsewhere in the province.
+    return filtered.select(output_name).addBands(
+        filtered.select(f"{output_name}_samples").unmask(0, False)
+    ).addBands(
+        available.select(f"{output_name}_samples").unmask(0, False).rename(expected_name)
+    )
+
+
 def _cams_pm_image(image):
     pm25 = image.select("particulate_matter_d_less_than_25_um_surface").multiply(
         KG_M3_TO_UG_M3
@@ -119,21 +132,24 @@ def build_ward_collection(start, end, province, ward_limit=None, include_annual=
         ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_NO2")
         .filterDate(str(start), str(end))
         .filterBounds(bounds)
-        .map(_quality_mask_no2)
     )
-    no2_image = _mean_and_count(
+    no2_image = _satellite_mean_and_count(
         no2,
         "tropospheric_NO2_column_number_density",
         "no2_tropospheric_column_mol_m2",
+        "no2_expected_samples",
+        _quality_mask_no2,
     )
 
     so2 = (
         ee.ImageCollection("COPERNICUS/S5P/OFFL/L3_SO2")
         .filterDate(str(start), str(end))
         .filterBounds(bounds)
-        .map(_quality_mask_so2)
     )
-    so2_image = _mean_and_count(so2, "SO2_column_number_density", "so2_column_mol_m2")
+    so2_image = _satellite_mean_and_count(
+        so2, "SO2_column_number_density", "so2_column_mol_m2",
+        "so2_expected_samples", _quality_mask_so2,
+    )
 
     cams = (
         ee.ImageCollection("ECMWF/CAMS/NRT")
@@ -189,14 +205,15 @@ def build_ward_collection(start, end, province, ward_limit=None, include_annual=
     expected_days = (end - start).days
 
     def add_metadata(feature):
+        centroid = feature.geometry().centroid(1)
         values = {
             "period_start": str(start),
             "period_end": str(end),
             "ward_area_m2": feature.geometry().area(1),
+            "latitude": centroid.coordinates().get(1),
+            "longitude": centroid.coordinates().get(0),
             "era5_expected_samples": era5.size(),
             "era5_expected_days": expected_days,
-            "no2_expected_samples": no2.size(),
-            "so2_expected_samples": so2.size(),
             "cams_pm_expected_samples": cams_pm.size(),
             "cams_uv_expected_samples": cams_uv.size(),
         }
@@ -217,6 +234,8 @@ def export_to_storage(collection, bucket_name, prefix, include_annual=False):
         "Municipali",
         "District",
         "Province",
+        "latitude",
+        "longitude",
         "period_start",
         "period_end",
         "ward_area_m2",

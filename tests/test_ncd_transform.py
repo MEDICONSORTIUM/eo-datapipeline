@@ -1,5 +1,6 @@
 """Offline tests for NCD validation, units, missing data, and annual handling."""
 
+import json
 import unittest
 from datetime import date
 
@@ -92,6 +93,87 @@ class TestNcdTransform(unittest.TestCase):
         row = result[result["variable_code"] == "pm25_mean_ug_m3"].iloc[0]
         self.assertIsNone(row["value"])
         self.assertEqual(row["quality_flag"], "MISSING")
+
+    def test_satellite_coverage_uses_local_sample_opportunities(self):
+        """
+        test_satellite_coverage_uses_local_sample_opportunities()
+        --------------------------------------------------------
+        Local counts retain usable gas values without lowering the 20% gate.
+
+        Parameters:
+        -----------
+        none
+
+        Returns:
+        --------
+        void - asserts local coverage, rejection and expected-count provenance.
+        """
+        for expected, flag in [(20, "PASS"), (300, "LOW_COVERAGE"), (0, "NO_SOURCE_DATA")]:
+            with self.subTest(expected=expected):
+                self.frame.loc[0, "no2_expected_samples"] = expected
+                result = build_observation_frame(
+                    self.frame, date(2026, 1, 1), date(2026, 2, 1), 7
+                )
+                row = result[result["variable_code"] == "no2_tropospheric_column_mol_m2"].iloc[0]
+                self.assertEqual(row["quality_flag"], flag)
+                if flag == "PASS":
+                    self.assertAlmostEqual(row["value"], 0.0001)
+                    self.assertAlmostEqual(row["coverage_fraction"], 0.6)
+                else:
+                    self.assertIsNone(row["value"])
+                self.assertEqual(json.loads(row["processing_metadata"])["expected_sample_count"], expected)
+
+    def test_location_metadata_survives_transformation(self):
+        """
+        test_location_metadata_survives_transformation()
+        ------------------------------------------------
+        Ward location metadata remains available even for rejected measurements.
+
+        Parameters:
+        -----------
+        none
+
+        Returns:
+        --------
+        void - asserts source metadata is retained in every normalized row.
+        """
+        self.frame["Municipali"] = "Greater Giyani Local Municipality"
+        self.frame["District"] = "Mopani"
+        self.frame["latitude"] = -23.36990468117883
+        self.frame["longitude"] = 30.35782285666032
+        self.frame.loc[0, "no2_expected_samples"] = 300
+        result = build_observation_frame(
+            self.frame, date(2026, 1, 1), date(2026, 2, 1), 7
+        )
+        for text in result["processing_metadata"]:
+            metadata = json.loads(text)
+            self.assertEqual(metadata["municipality"], "Greater Giyani Local Municipality")
+            self.assertEqual(metadata["district"], "Mopani")
+            self.assertAlmostEqual(metadata["latitude"], -23.36990468117883)
+            self.assertAlmostEqual(metadata["longitude"], 30.35782285666032)
+
+    def test_missing_location_is_json_null(self):
+        """
+        test_missing_location_is_json_null()
+        ------------------------------------
+        Missing export metadata must not become NaN or fabricated coordinates.
+
+        Parameters:
+        -----------
+        none
+
+        Returns:
+        --------
+        void - asserts JSON nulls for unavailable location fields.
+        """
+        self.frame["Municipali"] = float("nan")
+        self.frame["latitude"] = "invalid"
+        result = build_observation_frame(
+            self.frame, date(2026, 1, 1), date(2026, 2, 1), 7
+        )
+        metadata = json.loads(result.iloc[0]["processing_metadata"])
+        for key in ("municipality", "district", "latitude", "longitude"):
+            self.assertIsNone(metadata[key])
 
     def test_low_coverage_value_is_rejected(self):
         """

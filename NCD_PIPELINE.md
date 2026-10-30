@@ -96,11 +96,30 @@ flag when there is no existing valid row; they are never replaced with zero.
 The first-release coverage thresholds are 90% for ERA5/CAMS, 20% for Sentinel-5P,
 and 20% for Dynamic World scene coverage. Sentinel-5P L3 validity filters are
 provided by the catalogue, with an additional cloud-fraction threshold of 0.30.
+For Sentinel-5P, expected samples are counted per pixel from the available source
+band before the additional cloud filter. Valid samples are counted after that
+filter. Both count images include zeros and are averaged over the same ward grid;
+coverage is the ratio of those ward means. Images elsewhere in the province do
+not inflate the denominator. This is retention of catalogue-valid samples under
+the additional cloud filter, not a fraction of calendar days with observations.
+The expected sample count and coverage method are retained in processing metadata.
 Negative SO2 retrievals that survive source filtering are not changed. Negative
 PM or UV values and built-up fractions outside 0-1 are stored as null with an
 `OUT_OF_RANGE` flag. CAMS uses
 the 00 UTC model cycle and first-day forecast steps only, so repeated five-day
 forecasts are not counted as separate observations.
+
+NCD exports include ward-centroid latitude/longitude and retain municipality,
+district and coordinates in each observation's `processing_metadata`. This does
+not require changes to shared regions or malaria tables. Missing location fields
+remain JSON nulls.
+
+After the coverage/location correction, rerun affected months using fresh Earth
+Engine exports, starting with a three-ward smoke test. Do not reload older CSVs:
+they contain province-wide expected counts and lack coordinates. The existing
+`ncd-v1` observation identity is retained so reruns repair rows in place rather
+than creating duplicate scoring inputs. Manifests record the corrected coverage
+method. Existing database rows are unchanged until a rerun completes.
 
 ## Dataset limits
 
