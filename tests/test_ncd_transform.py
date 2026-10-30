@@ -71,6 +71,11 @@ class TestNcdTransform(unittest.TestCase):
         self.assertTrue(all(result["quality_flag"] == "PASS"))
         self.assertEqual(set(result["period_start"]), {date(2026, 1, 1)})
         self.assertEqual(set(result["period_end"]), {date(2026, 2, 1)})
+        model = result[result["source_code"].isin(["ERA5_LAND", "CAMS_NRT"])]
+        for text in model["processing_metadata"]:
+            metadata = json.loads(text)
+            self.assertEqual(metadata["aggregation_scale_m"], 1000)
+            self.assertEqual(metadata["aggregation_method"], "ward_mean_nearest_neighbour_grid")
 
     def test_missing_value_is_sql_null_not_zero(self):
         """

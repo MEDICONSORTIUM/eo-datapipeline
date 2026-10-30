@@ -92,6 +92,37 @@ class TestSatelliteMeanAndCount(unittest.TestCase):
         collection.size.assert_not_called()
 
 
+class TestBuildWardCollection(unittest.TestCase):
+    """Model extraction retains small wards without changing satellite grids."""
+
+    @patch("ncd.earth_engine.ee")
+    @patch("ncd.earth_engine._satellite_mean_and_count")
+    @patch("ncd.earth_engine._daily_temperature")
+    @patch("ncd.earth_engine._mean_and_count")
+    def test_models_use_small_ward_grid(self, mean_and_count, daily, satellite, ee):
+        """
+        test_models_use_small_ward_grid()
+        ---------------------------------
+        Coarse model cells must not cause small ward polygons to receive zero weight.
+
+        Parameters:
+        -----------
+        mocked Earth Engine builders : MagicMock
+
+        Returns:
+        --------
+        void - asserts the model grid is 1 km while satellite extraction stays 3.5 km.
+        """
+        earth_engine.build_ward_collection(date(2026, 1, 1), date(2026, 2, 1), "Limpopo")
+        era_reduction = mean_and_count.return_value.addBands.return_value.reduceRegions
+        cams_reduction = ee.Image.cat.return_value.addBands.return_value.reduceRegions
+        self.assertEqual(era_reduction.call_args.kwargs["scale"], 1000)
+        self.assertEqual(cams_reduction.call_args.kwargs["scale"], 1000)
+        self.assertEqual(satellite.return_value.reduceRegions.call_count, 2)
+        for call in satellite.return_value.reduceRegions.call_args_list:
+            self.assertEqual(call.kwargs["scale"], 3500)
+
+
 class TestNcdPipelineFailures(unittest.TestCase):
     """External-service failures retain run records and short-lived connections."""
 

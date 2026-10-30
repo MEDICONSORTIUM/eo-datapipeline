@@ -18,6 +18,7 @@ from etl_pipeline import create_google_clients, wait_for_export
 from . import database as ncd_database
 from .earth_engine import PROJECT_ID, PROVINCES, build_ward_collection, export_to_storage
 from .transform import build_observation_frame
+from .sources import MODEL_WARD_SCALE_M
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -135,6 +136,7 @@ def main(arguments=None):
                 {
                     "boundary_version": "MDB_Wards_2020",
                     "satellite_coverage_method": "ward_mean_counts_before_after_cloud_filter",
+                    "model_aggregation_scale_m": MODEL_WARD_SCALE_M,
                     "include_annual": include_annual,
                     "method_version": "ncd-v1",
                     "observation_rows": len(observations),

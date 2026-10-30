@@ -114,6 +114,14 @@ district and coordinates in each observation's `processing_metadata`. This does
 not require changes to shared regions or malaria tables. Missing location fields
 remain JSON nulls.
 
+ERA5 and CAMS ward means use a 1,000 m calculation grid with Earth Engine's default
+nearest-neighbour sampling. A calculation at native model resolution can give
+small wards zero intersection weight and return null even where source data
+exists. The finer grid avoids this polygon-weight limit; source resolution remains
+approximately 9 km for ERA5 and 44.5 km for CAMS. It does not create ward-level
+model detail. Model observations record the calculation scale and method, and
+manifests record the model aggregation scale. Genuine source gaps remain null.
+
 After the coverage/location correction, rerun affected months using fresh Earth
 Engine exports, starting with a three-ward smoke test. Do not reload older CSVs:
 they contain province-wide expected counts and lack coordinates. The existing

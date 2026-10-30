@@ -5,7 +5,7 @@ from datetime import date
 
 import pandas as pd
 
-from .sources import INDICATORS, SOURCE_VERSIONS
+from .sources import INDICATORS, MODEL_WARD_SCALE_M, SOURCE_VERSIONS
 
 
 REQUIRED_EXPORT_COLUMNS = {
@@ -116,6 +116,9 @@ def build_observation_frame(frame, requested_start, requested_end, etl_run_id, i
             }
             if indicator["source_code"] in {"S5P_NO2_OFFL", "S5P_SO2_OFFL"}:
                 metadata["coverage_method"] = "ward_mean_counts_before_after_cloud_filter"
+            if indicator["source_code"] in {"ERA5_LAND", "CAMS_NRT"}:
+                metadata["aggregation_scale_m"] = MODEL_WARD_SCALE_M
+                metadata["aggregation_method"] = "ward_mean_nearest_neighbour_grid"
             rows.append(
                 {
                     "region_code": region_code,

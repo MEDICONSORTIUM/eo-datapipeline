@@ -4,7 +4,7 @@ from datetime import date
 
 import ee
 
-from .sources import KG_M3_TO_UG_M3, UV_DOSE_RATE_TO_INDEX
+from .sources import KG_M3_TO_UG_M3, MODEL_WARD_SCALE_M, UV_DOSE_RATE_TO_INDEX
 
 
 PROJECT_ID = "modis-temperature-data"
@@ -102,7 +102,7 @@ def _cams_pm_image(image):
 
 
 def build_ward_collection(start, end, province, ward_limit=None, include_annual=False):
-    """Build source-filtered ward summaries at each source's native scale."""
+    """Build source-filtered ward summaries without losing small ward polygons."""
     wards = ee.FeatureCollection(WARD_ASSET).filter(ee.Filter.eq("Province", province))
     if ward_limit:
         wards = wards.limit(ward_limit)
@@ -172,8 +172,11 @@ def build_ward_collection(start, end, province, ward_limit=None, include_annual=
         scale=UV_DOSE_RATE_TO_INDEX,
     )
 
+    # A native model cell can dwarf a ward, rounding its intersection weight to zero.
+    # The finer calculation grid uses default nearest-neighbour sampling; it does
+    # not create additional spatial detail in ERA5 or CAMS values.
     reduced = era_image.reduceRegions(
-        collection=wards, reducer=ee.Reducer.mean(), scale=11132, tileScale=4
+        collection=wards, reducer=ee.Reducer.mean(), scale=MODEL_WARD_SCALE_M, tileScale=4
     )
     reduced = no2_image.reduceRegions(
         collection=reduced, reducer=ee.Reducer.mean(), scale=3500, tileScale=4
@@ -182,7 +185,7 @@ def build_ward_collection(start, end, province, ward_limit=None, include_annual=
         collection=reduced, reducer=ee.Reducer.mean(), scale=3500, tileScale=4
     )
     reduced = cams_pm_image.addBands(cams_uv_image).reduceRegions(
-        collection=reduced, reducer=ee.Reducer.mean(), scale=44528, tileScale=4
+        collection=reduced, reducer=ee.Reducer.mean(), scale=MODEL_WARD_SCALE_M, tileScale=4
     )
 
     dynamic_world = None
