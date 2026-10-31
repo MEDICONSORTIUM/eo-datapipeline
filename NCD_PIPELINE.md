@@ -76,6 +76,24 @@ A normal manual run uses:
 python ncd_pipeline.py --month 2026-01
 ```
 
+To process several months in order, use an inclusive range instead of `--month`:
+
+```powershell
+python ncd_pipeline.py --start-month 2026-01 --end-month 2026-09
+```
+
+GitHub Actions accepts the matching `start_month` and `end_month` inputs, with
+`month` left empty. One workflow run completes each month before starting the
+next, using a separate ETL run and manifests for each month. Omit province for
+national processing and set `smoke_test=false` for all wards. The whole range is
+validated before external work: reversed ranges, mixed single/range arguments,
+dates before January 2026 and incomplete months fail immediately. If any month
+fails, later months are not started. Resume with that month as `start_month`;
+existing upserts safely handle partially completed months. The workflow's existing
+180-minute job timeout applies to the whole range; resume the remaining range if
+that limit is reached. Your terminal can close after dispatch because the sequence
+runs in GitHub Actions.
+
 If no month is given, the previous completed calendar month is selected. Months before
 January 2026 and incomplete current or future months are rejected. December runs also calculate the annual Dynamic World
 indicators for that calendar year. Other months do not repeat or relabel annual data.

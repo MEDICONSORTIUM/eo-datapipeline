@@ -9,6 +9,14 @@ on:
         description: "Optional month to process (YYYY-MM, January 2026 or later)"
         required: false
         type: string
+      start_month:
+        description: "First month of a sequential range (YYYY-MM); leave month empty"
+        required: false
+        type: string
+      end_month:
+        description: "Last completed month of the range (YYYY-MM, inclusive)"
+        required: false
+        type: string
       province:
         description: "Optional South African province"
         required: false
@@ -84,11 +92,15 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_SSLMODE: require
           RUN_MONTH: ${{ inputs.month }}
+          RUN_START_MONTH: ${{ inputs.start_month }}
+          RUN_END_MONTH: ${{ inputs.end_month }}
           RUN_PROVINCE: ${{ inputs.province }}
           RUN_SMOKE_TEST: ${{ inputs.smoke_test }}
         run: |
           args=()
           if [[ -n "$RUN_MONTH" ]]; then args+=(--month "$RUN_MONTH"); fi
+          if [[ -n "$RUN_START_MONTH" ]]; then args+=(--start-month "$RUN_START_MONTH"); fi
+          if [[ -n "$RUN_END_MONTH" ]]; then args+=(--end-month "$RUN_END_MONTH"); fi
           if [[ -n "$RUN_PROVINCE" ]]; then args+=(--province "$RUN_PROVINCE"); fi
           if [[ "$RUN_SMOKE_TEST" == "true" ]]; then args+=(--smoke-test); fi
           python ncd_pipeline.py "${args[@]}"

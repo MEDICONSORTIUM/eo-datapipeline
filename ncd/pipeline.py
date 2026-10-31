@@ -46,10 +46,37 @@ def month_range(month_text=None):
 def parse_args(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--month", help="Month to process, for example 2026-01.")
+    parser.add_argument("--start-month", help="First month of an inclusive sequential backfill.")
+    parser.add_argument("--end-month", help="Last month of an inclusive sequential backfill.")
     parser.add_argument("--province", choices=PROVINCES, help="Process only one province.")
     parser.add_argument("--smoke-test", action="store_true", help="Process three wards only.")
     parser.add_argument("--bucket", help="Cloud Storage bucket; overrides BUCKET_NAME.")
     return parser.parse_args(arguments)
+
+
+def requested_periods(args):
+    """Validate the entire request before starting any collection or database writes."""
+    if args.start_month or args.end_month:
+        if args.month or not (args.start_month and args.end_month):
+            raise ValueError("Use either --month or both --start-month and --end-month.")
+        first = month_range(args.start_month)[0]
+        last = month_range(args.end_month)[0]
+        if last < first:
+            raise ValueError("End month must be on or after start month.")
+    else:
+        first = last = month_range(args.month)[0]
+    if first < date(2026, 1, 1):
+        raise ValueError("The approved NCD backfill starts in January 2026.")
+    today = date.today()
+    if last >= date(today.year, today.month, 1):
+        raise ValueError("Choose completed calendar months for NCD processing.")
+    periods = []
+    start = first
+    while start <= last:
+        start, end = month_range(start.strftime("%Y-%m"))
+        periods.append((start, end))
+        start = end
+    return periods
 
 
 def _write_manifest(bucket, prefix, content):
@@ -74,13 +101,14 @@ def main(arguments=None):
     bucket_name = args.bucket or os.environ.get("BUCKET_NAME")
     if not bucket_name:
         raise ValueError("Set BUCKET_NAME or pass --bucket.")
-    start, end = month_range(args.month)
-    if start < date(2026, 1, 1):
-        raise ValueError("The approved NCD backfill starts in January 2026.")
-    today = date.today()
-    current_month = date(today.year, today.month, 1)
-    if start >= current_month:
-        raise ValueError("Choose a completed calendar month for NCD processing.")
+    periods = requested_periods(args)
+    for position, (start, end) in enumerate(periods, start=1):
+        logging.info("NCD month %s of %s: %s", position, len(periods), start.strftime("%Y-%m"))
+        _run_month(args, start, end, bucket_name)
+
+
+def _run_month(args, start, end, bucket_name):
+    """Complete one month before the next starts; propagate failures to stop the range."""
     include_annual = start.month == 12
     provinces = [args.province] if args.province else PROVINCES
     if args.smoke_test and not args.province:

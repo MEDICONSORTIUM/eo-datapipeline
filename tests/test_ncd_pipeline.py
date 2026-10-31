@@ -92,6 +92,118 @@ class TestSatelliteMeanAndCount(unittest.TestCase):
         collection.size.assert_not_called()
 
 
+class TestRequestedPeriods(unittest.TestCase):
+    """Month ranges are inclusive, ordered and validated before external work."""
+
+    def test_range_crosses_year_boundary_in_order(self):
+        """
+        test_range_crosses_year_boundary_in_order()
+        -------------------------------------------
+        Inclusive ranges preserve every month and half-open period across December.
+
+        Parameters:
+        -----------
+        none
+
+        Returns:
+        --------
+        void - asserts ordered month starts and the final exclusive end.
+        """
+        args = pipeline.parse_args(["--start-month", "2026-11", "--end-month", "2027-01"])
+        with patch.object(pipeline, "date", wraps=date) as calendar:
+            calendar.today.return_value = date(2027, 2, 1)
+            periods = pipeline.requested_periods(args)
+        self.assertEqual([start for start, end in periods],
+                         [date(2026, 11, 1), date(2026, 12, 1), date(2027, 1, 1)])
+        self.assertEqual(periods[-1][1], date(2027, 2, 1))
+
+    def test_invalid_ranges_are_rejected(self):
+        """
+        test_invalid_ranges_are_rejected()
+        -----------------------------------
+        Ambiguous, reversed, unapproved and incomplete ranges cannot start work.
+
+        Parameters:
+        -----------
+        none
+
+        Returns:
+        --------
+        void - asserts each invalid request fails validation.
+        """
+        cases = [
+            ["--start-month", "2026-01"],
+            ["--end-month", "2026-09"],
+            ["--month", "2026-01", "--start-month", "2026-01", "--end-month", "2026-02"],
+            ["--start-month", "2026-03", "--end-month", "2026-01"],
+            ["--start-month", "2025-12", "--end-month", "2026-01"],
+            ["--start-month", "2026-01", "--end-month", "2026-10"],
+            ["--start-month", "bad-date", "--end-month", "2026-09"],
+        ]
+        with patch.object(pipeline, "date", wraps=date) as calendar:
+            calendar.today.return_value = date(2026, 10, 31)
+            for arguments in cases:
+                with self.subTest(arguments=arguments), self.assertRaises(ValueError):
+                    pipeline.requested_periods(pipeline.parse_args(arguments))
+
+
+class TestSequentialMonths(unittest.TestCase):
+    """A single dispatch completes months in order and stops at the first failure."""
+
+    @patch("ncd.pipeline._run_month")
+    def test_range_stops_at_failed_month(self, run_month):
+        """
+        test_range_stops_at_failed_month()
+        -----------------------------------
+        A failed February must prevent March from starting after January succeeds.
+
+        Parameters:
+        -----------
+        run_month : MagicMock
+
+        Returns:
+        --------
+        void - asserts sequential arguments and immediate failure propagation.
+        """
+        run_month.side_effect = [None, RuntimeError("February failed")]
+        with patch.dict(os.environ, {"BUCKET_NAME": "ncd-bucket"}, clear=True), \
+             patch.object(pipeline, "load_dotenv"), \
+             patch.object(pipeline, "date", wraps=date) as calendar:
+            calendar.today.return_value = date(2026, 10, 31)
+            with self.assertRaisesRegex(RuntimeError, "February failed"):
+                pipeline.main(["--start-month", "2026-01", "--end-month", "2026-03"])
+        self.assertEqual([call.args[1] for call in run_month.call_args_list],
+                         [date(2026, 1, 1), date(2026, 2, 1)])
+
+    @patch("ncd.pipeline._run_month")
+    def test_range_completes_all_months_with_shared_options(self, run_month):
+        """
+        test_range_completes_all_months_with_shared_options()
+        -----------------------------------------------------
+        The chosen province and smoke-test setting apply to every requested month.
+
+        Parameters:
+        -----------
+        run_month : MagicMock
+
+        Returns:
+        --------
+        void - asserts all months run in chronological order with consistent options.
+        """
+        with patch.dict(os.environ, {"BUCKET_NAME": "ncd-bucket"}, clear=True), \
+             patch.object(pipeline, "load_dotenv"), \
+             patch.object(pipeline, "date", wraps=date) as calendar:
+            calendar.today.return_value = date(2026, 10, 31)
+            pipeline.main(["--start-month", "2026-01", "--end-month", "2026-03",
+                           "--province", "Limpopo", "--smoke-test"])
+        self.assertEqual([call.args[1] for call in run_month.call_args_list],
+                         [date(2026, 1, 1), date(2026, 2, 1), date(2026, 3, 1)])
+        for call in run_month.call_args_list:
+            self.assertEqual(call.args[0].province, "Limpopo")
+            self.assertTrue(call.args[0].smoke_test)
+            self.assertEqual(call.args[3], "ncd-bucket")
+
+
 class TestBuildWardCollection(unittest.TestCase):
     """Model extraction retains small wards without changing satellite grids."""
 
